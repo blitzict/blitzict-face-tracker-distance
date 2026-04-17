@@ -1,12 +1,13 @@
 """
-Custom Face Detector
-─────────────────────────────────────────────────────────────
-Lightweight binary CNN: face vs background.
-Input  : 64×64 RGB patch
-Output : scalar logit (positive = face)
+facetrack.detector  —  binary face / background classifier
+===========================================================
+Lightweight CNN (~200 k parameters).
+    Input   : 64×64 RGB patch
+    Output  : scalar logit (positive ⇒ face)
 
-At inference we run this as a GPU-batched sliding window across
-multiple scales, then apply NMS to get clean bounding boxes.
+At inference we run this as a GPU-batched sliding window across multiple
+scales and take the local maxima of the resulting heatmap — see
+`facetrack.pipeline` for the wiring.
 """
 
 import torch

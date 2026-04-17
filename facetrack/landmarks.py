@@ -1,6 +1,6 @@
 """
-landmark_model.py  —  5-point face landmark regressor
-======================================================
+facetrack.landmarks  —  5-point face landmark regressor
+========================================================
 
 Architecture
 ────────────
@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 
-from face_detector_model import DETECTOR_PATCH_SIZE
+from facetrack.detector import DETECTOR_PATCH_SIZE
 
 LANDMARK_PATCH_SIZE = DETECTOR_PATCH_SIZE   # 64 — same as detector input
 NUM_LANDMARKS       = 5                     # left eye, right eye, nose, left mouth, right mouth

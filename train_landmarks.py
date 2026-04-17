@@ -40,7 +40,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-from landmark_model import LandmarkCNN, LANDMARK_TRAIN_TF, LANDMARK_INFER_TF
+from facetrack.landmarks import LandmarkCNN, LANDMARK_TRAIN_TF, LANDMARK_INFER_TF
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 WIDER_DIR        = Path('datasets/tmp_wider')

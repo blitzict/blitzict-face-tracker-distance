@@ -2,8 +2,10 @@
 datasets/
 DnHFaces/
 
-# Trained weights can be big; comment these out if you want to ship them
-# checkpoints/*.pth
+# Ignore all checkpoints by default, except the two required for inference
+checkpoints/*
+!checkpoints/face_detector.pth
+!checkpoints/landmark_net.pth
 
 # Temporary artefacts
 screenshot_*.png
@@ -31,3 +33,6 @@ dist/
 .kaggle/
 kaggle.json
 .face_calib.json
+
+# Claude Code local state
+.claude/

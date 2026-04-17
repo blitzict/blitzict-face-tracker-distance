@@ -53,7 +53,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from face_detector_model import FaceDetectorCNN, DETECTOR_TRAIN_TF, DETECTOR_INFER_TF, DETECTOR_PATCH_SIZE
+from facetrack.detector import FaceDetectorCNN, DETECTOR_TRAIN_TF, DETECTOR_INFER_TF, DETECTOR_PATCH_SIZE
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 PHOTOS_ALL_DIR  = Path('DnHFaces/open_data_set/photos_all')
