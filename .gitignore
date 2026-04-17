@@ -1,0 +1,33 @@
+# Datasets — huge, users download themselves
+datasets/
+DnHFaces/
+
+# Trained weights can be big; comment these out if you want to ship them
+# checkpoints/*.pth
+
+# Temporary artefacts
+screenshot_*.png
+*.tgz
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+.kaggle/
+kaggle.json
+.face_calib.json
