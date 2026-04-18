@@ -10,12 +10,11 @@ python run.py --camera 0
 - **Distance in metres** shown live, yaw-corrected so it stays accurate when you turn your head.
 - **Press `C`** once at exactly 1 m from the camera to calibrate focal length → ~±3 % accuracy from then on.
 
-No MediaPipe, no Haar cascade, no pre-trained black boxes.
+Everything is built from scratch — custom detector, custom landmark regressor, trained end-to-end on open face datasets.
 
-### What this is — and isn't
+### What this does
 
-- **Is:** face *detection* + 5-point *landmark regression* + monocular *distance estimation*.
-- **Isn't:** face *recognition*. There is no identity embedder, no verification, no "who is this" step.
+Face **detection** + 5-point **landmark regression** + monocular **distance estimation**, in a single real-time pipeline.
 
 ---
 
@@ -76,7 +75,7 @@ No MediaPipe, no Haar cascade, no pre-trained black boxes.
 | `FaceDetectorCNN` | `facetrack/detector.py`  | ~200 k  | 64 × 64 RGB | scalar logit — face vs background      |
 | `LandmarkCNN`     | `facetrack/landmarks.py` | ~150 k  | 64 × 64 RGB | 10 floats — 5 (x, y) landmark coords   |
 
-Both are **custom** architectures sharing the same 4-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks). **Not** EfficientNet, ResNet, or any pre-trained backbone. Trained checkpoints (~5 MB total) live in `checkpoints/`.
+Both are **custom** architectures sharing the same 4-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks), trained end-to-end on the dataset mix below. Trained checkpoints (~5 MB total) live in `checkpoints/`.
 
 ---
 
@@ -127,7 +126,6 @@ Cheap future wins: weighted filter scoring instead of AND, flip-TTA on the landm
 - **Single-face only.** By design — no multi-person support.
 - **`DET_THRESH` is environment-dependent** and may need tuning (see *Tuning* below).
 - **Top-K heatmap peaks, not NMS / connected components** — can miss overlapping faces.
-- **No face recognition / identity embedding.** Detection + landmarks only.
 
 ---
 
@@ -248,8 +246,8 @@ All tunables live in `facetrack/config.py`.
 
 ## Design decisions
 
-- **No MediaPipe / Haar at inference.** The whole point was to build every piece from scratch.
-- **Top-K peaks instead of connected components.** Simpler; landmark plausibility + filters do the FP rejection better than CC regions ever did.
+- **Everything from scratch.** The whole point was to build and train every piece end-to-end on open face datasets.
+- **Top-K peaks over the detector heatmap.** Simpler than connected components; landmark plausibility + filters do the FP rejection just as well.
 - **EMA smoothing instead of Kalman.** Two multiplies per coord per frame vs. dozens, and the motion isn't complex enough to need a dynamical model.
 - **Single-face tracker.** The classic "box jumps to a wall" failure comes from multi-track logic treating each detection independently. A single sticky track is simpler and more robust for the one-person use case.
 - **Shipping the trained checkpoints.** They're small (~5 MB total) — cloning and running `python run.py` should just work. Training is an optional rebuild.
