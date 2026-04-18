@@ -77,7 +77,7 @@ Face **detection** + 5-point **landmark regression** + monocular **distance esti
 
 Both are **custom** architectures. The detector is a 5-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks) with double conv per block and a small MLP head; the landmark net is a narrower 4-block variant of the same pattern, trained at 64×64. Detector and landmark patch sizes are decoupled: you can retrain the detector at a different resolution without invalidating the landmark checkpoint.
 
-> **v2 upgrade note.** An earlier v1 of the detector was ~200 k params at 64×64. It overfit to the LFW + CelebA distribution and generalised poorly to arbitrary webcams / people. The v2 above increases capacity 5×, moves to 96×96, and trains with much heavier augmentation + two demographic-balanced datasets (UTKFace, FairFace). The shipped v1 checkpoint is not compatible with the v2 architecture — retrain via `python train_detector.py`.
+> **v2 upgrade note.** An earlier v1 of the detector was ~200 k params at 64×64. It overfit to the LFW + CelebA distribution and generalised poorly to arbitrary webcams / people. The v2 shipped here increases capacity 5×, moves to 96×96, and trains with much heavier augmentation + UTKFace (FairFace optional) for demographic coverage. The v1 weights are preserved for reference in `checkpoints/face_detector_v1_legacy.pth` (gitignored; recover from git history if needed).
 
 ---
 
@@ -144,7 +144,7 @@ pip install -r requirements.txt
 python run.py --camera 0
 ```
 
-> The shipped `checkpoints/face_detector.pth` is the **v1** 200 k-param model at 64×64 and **does not load** into the v2 architecture above — you'll see a `state_dict` size-mismatch on startup. Retrain once with `python train_detector.py` to produce a fresh v2 checkpoint. The shipped `checkpoints/landmark_net.pth` is unchanged and still works.
+The shipped `checkpoints/face_detector.pth` is the trained v2 model — no training needed to run. If you want to rebuild it with your own data, see the Training section.
 
 Controls while running:
 
