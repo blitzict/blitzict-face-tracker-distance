@@ -36,6 +36,8 @@ USAGE
     python train_face_detector.py
 """
 
+import argparse
+import gc
 import json
 import random
 import time
@@ -64,9 +66,10 @@ WIDER_FACE_CROPS_DIR = Path('datasets/wider_face_crops') # flat face crops extra
 CELEBA_DIR           = Path('datasets/tmp_celeba/img_align_celeba/img_align_celeba')
 UTKFACE_DIR          = Path('datasets/utkface')          # populated by download_datasets.py --utk
 FAIRFACE_DIR         = Path('datasets/fairface')         # manual (see download_datasets.py --fairface)
-CELEBA_MAX           = 30_000                             # cap CelebA positives
+CELEBA_MAX           = 25_000                             # cap CelebA positives
 UTKFACE_MAX          = 23_000                             # UTKFace is ~23k total — take all
-FAIRFACE_MAX         = 40_000                             # cap FairFace to keep epoch time sane
+FAIRFACE_MAX         = 25_000                             # cap FairFace — higher values OOM on 32GB RAM
+                                                          # with all datasets loaded as PIL objects
 ANNO_FILE       = Path('checkpoints/face_detector_annotations.json')
 CKPT_PATH       = Path('checkpoints/face_detector.pth')
 CKPT_DIR        = Path('checkpoints')
@@ -77,7 +80,9 @@ EPOCHS_PHASE2  = 40
 BATCH_SIZE     = 128
 LR             = 3e-3
 WEIGHT_DECAY   = 1e-4
-NUM_WORKERS    = 4
+NUM_WORKERS    = 2       # workers fork-copy the in-memory PIL sample list.
+                         # Each additional worker roughly doubles RAM for
+                         # big datasets — 2 is the sweet spot on 32GB.
 NEG_PER_IMAGE  = 10     # random negative crops per full-scene image
 IOU_THRESH     = 0.25   # crop must have IoU < this with ALL face boxes to be a negative
 
@@ -617,29 +622,52 @@ def run_training(model, tr_samples, va_samples, device, epochs, lr, label):
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train():
+def train(resume_from_phase1: bool = False):
     CKPT_DIR.mkdir(exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}\n')
 
     annotations = auto_annotate()
 
-    # Phase 1: bootstrap
-    print('\nBuilding Phase-1 dataset ...')
-    samples = build_samples(annotations, hard_negs=None)
-    labels  = [l for _, l in samples]
-    tr_idx, va_idx = train_test_split(range(len(samples)), test_size=0.15,
-                                      random_state=42, stratify=labels)
     model = FaceDetectorCNN().to(device)
-    run_training(model,
-                 [samples[i] for i in tr_idx],
-                 [samples[i] for i in va_idx],
-                 device, EPOCHS_PHASE1, LR, 'Phase 1 — Bootstrap')
 
-    # Phase 2: hard negative mining + retrain
-    ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model'])
+    if resume_from_phase1:
+        # Skip Phase 1 training — load the existing best checkpoint and go
+        # straight to mining. Useful after a Phase 2 OOM or crash.
+        print(f'Resuming from existing Phase 1 checkpoint: {CKPT_PATH}')
+        ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model'])
+        print(f'  Loaded (epoch {ckpt.get("epoch", "?")}, val_loss {ckpt.get("val_loss", "?"):.4f})')
+    else:
+        # Phase 1: bootstrap
+        print('\nBuilding Phase-1 dataset ...')
+        samples = build_samples(annotations, hard_negs=None)
+        labels  = [l for _, l in samples]
+        tr_idx, va_idx = train_test_split(range(len(samples)), test_size=0.15,
+                                          random_state=42, stratify=labels)
+        run_training(model,
+                     [samples[i] for i in tr_idx],
+                     [samples[i] for i in va_idx],
+                     device, EPOCHS_PHASE1, LR, 'Phase 1 — Bootstrap')
+
+        # Free Phase-1 sample objects before Phase-2 starts loading —
+        # otherwise both datasets (plus fork-copies in DataLoader workers)
+        # sit in RAM simultaneously and trigger OOM on 32 GB machines.
+        del samples, labels, tr_idx, va_idx
+        gc.collect()
+
+        # Reload best Phase-1 weights (run_training saves best, not last)
+        ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model'])
+
+    # Phase 2: hard negative mining + retrain (from-scratch weights)
     hard_negs = mine_hard_negatives(model, annotations, device)
+
+    # Free the Phase-1 model before loading Phase-2 data
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print('\nBuilding Phase-2 dataset ...')
     samples2 = build_samples(annotations, hard_negs=hard_negs)
@@ -657,4 +685,8 @@ def train():
 
 
 if __name__ == '__main__':
-    train()
+    p = argparse.ArgumentParser()
+    p.add_argument('--resume-from-phase1', action='store_true',
+                   help='Skip Phase-1 training; use existing checkpoint as mining seed.')
+    args = p.parse_args()
+    train(resume_from_phase1=args.resume_from_phase1)
