@@ -70,12 +70,14 @@ Face **detection** + 5-point **landmark regression** + monocular **distance esti
 
 ## Models
 
-| Model             | File                     | Params  | Input       | Output                                 |
-| ----------------- | ------------------------ | ------- | ----------- | -------------------------------------- |
-| `FaceDetectorCNN` | `facetrack/detector.py`  | ~200 k  | 64 × 64 RGB | scalar logit — face vs background      |
-| `LandmarkCNN`     | `facetrack/landmarks.py` | ~150 k  | 64 × 64 RGB | 10 floats — 5 (x, y) landmark coords   |
+| Model             | File                     | Params  | Input         | Output                                 |
+| ----------------- | ------------------------ | ------- | ------------- | -------------------------------------- |
+| `FaceDetectorCNN` | `facetrack/detector.py`  | ~1.04 M | 96 × 96 RGB   | scalar logit — face vs background      |
+| `LandmarkCNN`     | `facetrack/landmarks.py` | ~150 k  | 64 × 64 RGB   | 10 floats — 5 (x, y) landmark coords   |
 
-Both are **custom** architectures sharing the same 4-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks), trained end-to-end on the dataset mix below. Trained checkpoints (~5 MB total) live in `checkpoints/`.
+Both are **custom** architectures. The detector is a 5-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks) with double conv per block and a small MLP head; the landmark net is a narrower 4-block variant of the same pattern, trained at 64×64. Detector and landmark patch sizes are decoupled: you can retrain the detector at a different resolution without invalidating the landmark checkpoint.
+
+> **v2 upgrade note.** An earlier v1 of the detector was ~200 k params at 64×64. It overfit to the LFW + CelebA distribution and generalised poorly to arbitrary webcams / people. The v2 above increases capacity 5×, moves to 96×96, and trains with much heavier augmentation + two demographic-balanced datasets (UTKFace, FairFace). The shipped v1 checkpoint is not compatible with the v2 architecture — retrain via `python train_detector.py`.
 
 ---
 
@@ -87,8 +89,12 @@ Both are **custom** architectures sharing the same 4-block conv backbone (Conv �
 | ------------------ | ----------------------------------------------------- | ---------- | ------------------------------------------------------------ |
 | **LFW**            | Diverse face positives                                | 13 k       | `python download_datasets.py`                                |
 | **CelebA aligned** | Face positives + 5-point landmarks                    | 200 k      | `kaggle datasets download -d jessicali9530/celeba-dataset`   |
-| **WIDER-selected** | Face positives at varied scales + 68-point landmarks  | 4.3 k imgs | `kaggle datasets download -d alirezakay/wider-selected`      |
+| **WIDER FACE**     | Face positives at varied scales, occlusions, poses    | ~390 k     | `python download_datasets.py --wider`                        |
+| **UTKFace**        | Broad demographic spread (age / gender / ethnicity)   | 23 k       | `python download_datasets.py --utk`                          |
+| **FairFace**       | Demographically balanced (7 race groups × age × sex)  | 108 k      | `python download_datasets.py --fairface` (manual instructions) |
 | **Hard negatives** | False positives mined by Phase-1 detector             | ≤ 6 k      | Auto-generated during Phase-2 training                       |
+
+UTKFace and FairFace were added in the v2 upgrade specifically to defeat the demographic bias baked into LFW + CelebA. Training will degrade gracefully if either (or both) are missing — you just lose the corresponding generalisation boost.
 
 ### Explicitly not used — and why
 
@@ -131,12 +137,14 @@ Cheap future wins: weighted filter scoring instead of AND, flip-TTA on the landm
 
 ## Quick start
 
-### Inference (no training required — checkpoints are shipped)
+### Inference
 
 ```bash
 pip install -r requirements.txt
 python run.py --camera 0
 ```
+
+> The shipped `checkpoints/face_detector.pth` is the **v1** 200 k-param model at 64×64 and **does not load** into the v2 architecture above — you'll see a `state_dict` size-mismatch on startup. Retrain once with `python train_detector.py` to produce a fresh v2 checkpoint. The shipped `checkpoints/landmark_net.pth` is unchanged and still works.
 
 Controls while running:
 
@@ -166,9 +174,11 @@ Controls while running:
 pip install kaggle
 mkdir -p ~/.kaggle && cp kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
 
-python download_datasets.py
-kaggle datasets download -d alirezakay/wider-selected      -p datasets/tmp_wider  --unzip
-kaggle datasets download -d jessicali9530/celeba-dataset   -p datasets/tmp_celeba --unzip
+# LFW + WIDER + UTKFace in one go; FairFace prints manual instructions
+python download_datasets.py --all
+
+# CelebA (separate — big)
+kaggle datasets download -d jessicali9530/celeba-dataset -p datasets/tmp_celeba --unzip
 ```
 
 ### Face detector — two-phase training
@@ -177,7 +187,7 @@ kaggle datasets download -d jessicali9530/celeba-dataset   -p datasets/tmp_celeb
 python train_detector.py
 ```
 
-Phase 1 bootstraps on positives + random negatives for 40 epochs. Phase 2 mines the Phase-1 model's own false positives as hard negatives and re-trains from scratch for another 40 epochs. Reaches P = R = 1.00 on the held-out val split.
+Phase 1 bootstraps on positives + random negatives for 40 epochs. Phase 2 mines the Phase-1 model's own false positives as hard negatives and re-trains from scratch for another 40 epochs. With the v2 model (~1 M params, 96×96) and the full LFW + CelebA + WIDER + UTKFace + FairFace mix, expect ~2–3 hours on a single modern GPU.
 
 ### Landmark regressor
 

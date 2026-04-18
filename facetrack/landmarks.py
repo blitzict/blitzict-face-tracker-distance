@@ -26,10 +26,10 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 
-from facetrack.detector import DETECTOR_PATCH_SIZE
-
-LANDMARK_PATCH_SIZE = DETECTOR_PATCH_SIZE   # 64 — same as detector input
-NUM_LANDMARKS       = 5                     # left eye, right eye, nose, left mouth, right mouth
+LANDMARK_PATCH_SIZE = 64   # decoupled from detector patch size — the shipped
+                           # landmark checkpoint was trained at 64×64, so this
+                           # stays fixed even if DETECTOR_PATCH_SIZE changes.
+NUM_LANDMARKS       = 5    # left eye, right eye, nose, left mouth, right mouth
 NUM_OUTPUTS         = NUM_LANDMARKS * 2     # (x, y) per landmark
 
 

@@ -62,7 +62,11 @@ LFW_DIR              = Path('datasets/lfw')              # populated by download
 WIDER_FACE_DIR       = Path('datasets/wider_face')       # populated by download_datasets.py --wider
 WIDER_FACE_CROPS_DIR = Path('datasets/wider_face_crops') # flat face crops extracted from wider_face
 CELEBA_DIR           = Path('datasets/tmp_celeba/img_align_celeba/img_align_celeba')
+UTKFACE_DIR          = Path('datasets/utkface')          # populated by download_datasets.py --utk
+FAIRFACE_DIR         = Path('datasets/fairface')         # manual (see download_datasets.py --fairface)
 CELEBA_MAX           = 30_000                             # cap CelebA positives
+UTKFACE_MAX          = 23_000                             # UTKFace is ~23k total — take all
+FAIRFACE_MAX         = 40_000                             # cap FairFace to keep epoch time sane
 ANNO_FILE       = Path('checkpoints/face_detector_annotations.json')
 CKPT_PATH       = Path('checkpoints/face_detector.pth')
 CKPT_DIR        = Path('checkpoints')
@@ -373,6 +377,39 @@ def build_samples(annotations: dict, hard_negs: list = None):
         print('  (CelebA not found — run: '
               'kaggle datasets download -d jessicali9530/celeba-dataset '
               '-p datasets/tmp_celeba --unzip)')
+
+    # ── Positives: UTKFace (23k, broad demographic spread) ────────────────
+    utk_faces = []
+    if UTKFACE_DIR.exists():
+        utk_imgs = list(UTKFACE_DIR.glob('*.jpg'))
+        random.shuffle(utk_imgs)
+        for p in utk_imgs[:UTKFACE_MAX]:
+            try:
+                utk_faces.append(Image.open(p).convert('RGB'))
+            except Exception:
+                pass
+        for img in utk_faces:
+            samples.append((img, 1))
+        print(f'  + {len(utk_faces):,} UTKFace positives')
+    else:
+        print('  (UTKFace not found — run  python download_datasets.py --utk)')
+
+    # ── Positives: FairFace (108k, balanced across 7 race groups) ─────────
+    fair_faces = []
+    if FAIRFACE_DIR.exists():
+        fair_imgs = list(FAIRFACE_DIR.rglob('*.jpg'))
+        random.shuffle(fair_imgs)
+        for p in fair_imgs[:FAIRFACE_MAX]:
+            try:
+                fair_faces.append(Image.open(p).convert('RGB'))
+            except Exception:
+                pass
+        for img in fair_faces:
+            samples.append((img, 1))
+        print(f'  + {len(fair_faces):,} FairFace positives')
+    else:
+        print('  (FairFace not found — run  python download_datasets.py --fairface '
+              'for manual instructions)')
 
     # ── Positives: WIDER FACE crops (diverse scales / real-world distances) ──
     wider_faces = load_wider_face_crops(max_crops=30_000)
