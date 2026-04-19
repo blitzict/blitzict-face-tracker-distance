@@ -35,9 +35,10 @@ from facetrack.config import (
     IPD_METRES, NOSE_DEPTH_M, FOCAL_RATIO,
     FALLBACK_FACE_W_M, FALLBACK_FACE_FILL,
     SYMMETRY_THRESH, SKIN_RATIO_THRESH,
+    EYE_TO_MOUTH_M, MOUTH_WIDTH_M, DIST_CUE_WEIGHTS,
 )
 from facetrack.detector  import FaceDetectorCNN, DETECTOR_PATCH_SIZE
-from facetrack.landmarks import LandmarkCNN, LANDMARK_INFER_TF
+from facetrack.landmarks import LandmarkCNN, LANDMARK_INFER_TF, flip_landmarks_horizontal
 from facetrack.filters   import (
     plausible_face_geometry,
     symmetry_score,
@@ -349,9 +350,18 @@ class DetectionWorker:
         if self.landmark_net is not None:
             pil    = Image.fromarray(lm_crop[:, :, ::-1])        # BGR → RGB
             cw, ch = pil.size
-            t_in   = LANDMARK_INFER_TF(pil).unsqueeze(0).to(self.device)
+            # Horizontal-flip TTA: run the landmark net on both the crop and
+            # its mirror, un-flip the mirror's output, and average. Shares
+            # ground truth, has independent noise → averaging ≈ halves
+            # landmark jitter, which directly reduces distance jitter.
+            t_orig = LANDMARK_INFER_TF(pil).unsqueeze(0)
+            t_flip = torch.flip(t_orig, dims=[3])
+            batch  = torch.cat([t_orig, t_flip], dim=0).to(self.device)
             with torch.no_grad():
-                out10 = self.landmark_net(t_in).cpu().squeeze(0).tolist()
+                out2 = self.landmark_net(batch).cpu().numpy()
+            lm_orig = out2[0].tolist()
+            lm_flip_unflipped = flip_landmarks_horizontal(out2[1].tolist())
+            out10 = [(a + b) * 0.5 for a, b in zip(lm_orig, lm_flip_unflipped)]
             lx, ly, rx, ry, nx_, ny_, lmx, lmy, rmx, rmy = out10
 
             # ── Filters ──────────────────────────────────────────────────────
@@ -403,12 +413,31 @@ class DetectionWorker:
             if tx2 > tx1 and ty2 > ty1:
                 x1, y1, x2, y2 = tx1, ty1, tx2, ty2
 
-        # ── Distance from IPD (or fallback geometric formula) ────────────────
-        # Uses self.ipd_m (per-user configurable) rather than the population
-        # average IPD_METRES — lets users remove ~±5% bias by passing --ipd.
-        if ipd_px and ipd_px > 4:
-            dist_m = (self.ipd_m * focal_px) / ipd_px
-        else:
+        # ── Distance from multi-cue anthropometry (or face-width fallback) ──
+        # Three landmark-derived cues, weighted by anatomical stability:
+        #   • IPD                — yaw-corrected, dominant signal
+        #   • eye-to-mouth       — vertical, not affected by yaw
+        #   • mouth-width        — yaw-corrected
+        # Averaging independent noisy measurements reduces jitter by √N.
+        dist_m = None
+        if lmks_abs is not None and ipd_px and ipd_px > 4:
+            # eye-to-mouth distance in pixels (vertical, so no yaw correction)
+            e2m_px_val = float(max(mouth_mid_y - eye_mid_y, 1.0))
+            # mouth width in pixels (horizontal, apply yaw correction)
+            mw_px_raw  = float(np.hypot(lmx_abs - rmx_abs, lmy_abs - rmy_abs))
+            mw_px_val  = mw_px_raw / max(cos_yaw, 0.35)
+
+            d_ipd = (self.ipd_m      * focal_px) / ipd_px
+            d_e2m = (EYE_TO_MOUTH_M  * focal_px) / e2m_px_val
+            d_mw  = (MOUTH_WIDTH_M   * focal_px) / mw_px_val
+
+            w = DIST_CUE_WEIGHTS
+            dist_m = (w['ipd']          * d_ipd +
+                      w['eye_to_mouth'] * d_e2m +
+                      w['mouth_width']  * d_mw)
+
+        if dist_m is None:
+            # Landmarks failed — fall back to detection-box face width
             face_px = max(wsz * sx * FALLBACK_FACE_FILL, 1.0)
             dist_m  = (FALLBACK_FACE_W_M * focal_px) / face_px
         dist_m = round(max(0.3, min(dist_m, 10.0)), 2)
