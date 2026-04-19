@@ -77,6 +77,13 @@ class LandmarkCNN(nn.Module):
 
 
 # ── Image transforms ──────────────────────────────────────────────────────────
+#
+# Photometric transforms only — geometric transforms (flip / rotation / affine)
+# would invalidate landmark coordinates. Horizontal flip IS supported, but has
+# to happen inside the Dataset so the corresponding left/right labels can be
+# swapped at the same time (see LANDMARK_FLIP_PAIRS + LandmarkDataset).
+
+from facetrack.detector import AddGaussianNoise   # reuse the detector's noise aug
 
 LANDMARK_INFER_TF = T.Compose([
     T.Resize((LANDMARK_PATCH_SIZE, LANDMARK_PATCH_SIZE)),
@@ -84,15 +91,41 @@ LANDMARK_INFER_TF = T.Compose([
     T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
 ])
 
-# Training transform: we cannot use HFlip or rotation here — those would
-# invalidate the landmark coordinates.  Only photometric augs are safe.
 LANDMARK_TRAIN_TF = T.Compose([
     T.Resize((LANDMARK_PATCH_SIZE, LANDMARK_PATCH_SIZE)),
-    T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-    T.RandomGrayscale(p=0.1),
+    T.RandomApply([T.ColorJitter(brightness=0.4, contrast=0.4,
+                                 saturation=0.3, hue=0.08)], p=0.9),
+    T.RandomGrayscale(p=0.15),
+    T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.25),
+    T.RandomAutocontrast(p=0.20),
     T.ToTensor(),
+    AddGaussianNoise(p=0.25, sigma_max=0.03),
     T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
 ])
+
+# When horizontally flipping an image, these landmark-index pairs must be
+# swapped in the 5-point label vector (lex, ley, rex, rey, nox, noy,
+# lmx, lmy, rmx, rmy). Left eye ↔ right eye; left mouth ↔ right mouth.
+# Nose (index 2) stays in place; only its x flips.
+LANDMARK_FLIP_PAIRS = [(0, 1), (3, 4)]   # (left_eye, right_eye), (left_mouth, right_mouth)
+
+
+def flip_landmarks_horizontal(label_vec):
+    """
+    In-place mirror for a 10-float label vector after a horizontal image flip.
+        input:  [lex, ley, rex, rey, nox, noy, lmx, lmy, rmx, rmy]
+                (normalised to [0, 1])
+        output: same layout, with left/right swapped and x-coords mirrored.
+    """
+    out = list(label_vec)
+    # Mirror x-coordinates
+    for i in (0, 1, 2, 3, 4):
+        out[2*i] = 1.0 - out[2*i]
+    # Swap symmetrical pairs (eyes, mouth corners)
+    for a, b in LANDMARK_FLIP_PAIRS:
+        out[2*a],   out[2*b]   = out[2*b],   out[2*a]
+        out[2*a+1], out[2*b+1] = out[2*b+1], out[2*a+1]
+    return out
 
 
 def predict_eyes(model: LandmarkCNN, face_crop_pil, device) -> tuple:

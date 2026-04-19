@@ -66,23 +66,25 @@ WIDER_FACE_CROPS_DIR = Path('datasets/wider_face_crops') # flat face crops extra
 CELEBA_DIR           = Path('datasets/tmp_celeba/img_align_celeba/img_align_celeba')
 UTKFACE_DIR          = Path('datasets/utkface')          # populated by download_datasets.py --utk
 FAIRFACE_DIR         = Path('datasets/fairface')         # manual (see download_datasets.py --fairface)
-CELEBA_MAX           = 25_000                             # cap CelebA positives
-UTKFACE_MAX          = 23_000                             # UTKFace is ~23k total — take all
-FAIRFACE_MAX         = 25_000                             # cap FairFace — higher values OOM on 32GB RAM
-                                                          # with all datasets loaded as PIL objects
+HARD_NEG_CACHE_DIR   = Path('checkpoints/hard_neg_cache') # mined hard negatives, persisted to disk
+# Dataset caps. With the lazy-loading FacePatchDataset, these can be None ( = take all )
+# without RAM impact — samples are stored as (path, label, bbox) tuples.
+CELEBA_MAX           = None
+UTKFACE_MAX          = None
+FAIRFACE_MAX         = None
 ANNO_FILE       = Path('checkpoints/face_detector_annotations.json')
 CKPT_PATH       = Path('checkpoints/face_detector.pth')
 CKPT_DIR        = Path('checkpoints')
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 EPOCHS_PHASE1  = 40
-EPOCHS_PHASE2  = 40
+EPOCHS_PHASE2  = 30     # reduced from 40 — val typically saturates by epoch 20
+                        # on this dataset, so the extra 10 epochs buy little
 BATCH_SIZE     = 128
 LR             = 3e-3
 WEIGHT_DECAY   = 1e-4
-NUM_WORKERS    = 2       # workers fork-copy the in-memory PIL sample list.
-                         # Each additional worker roughly doubles RAM for
-                         # big datasets — 2 is the sweet spot on 32GB.
+NUM_WORKERS    = 4       # lazy-loading samples are just (path, label, bbox)
+                         # tuples, so fork-copy is cheap — 4 workers is fine.
 NEG_PER_IMAGE  = 10     # random negative crops per full-scene image
 IOU_THRESH     = 0.25   # crop must have IoU < this with ALL face boxes to be a negative
 
@@ -172,7 +174,7 @@ def auto_annotate(force: bool = False) -> dict:
 
 def load_wider_face_crops(max_crops: int = 30_000) -> list:
     """
-    Parse WIDER FACE train annotations and return PIL face crops.
+    Parse WIDER FACE train annotations and return lazy (path, bbox) tuples.
 
     Annotation format (wider_face_train_bbx_gt.txt):
         <relative_image_path>
@@ -181,7 +183,8 @@ def load_wider_face_crops(max_crops: int = 30_000) -> list:
         ...
 
     Only loads non-invalid, non-heavily-occluded faces to keep quality high.
-    Caps at max_crops to stay memory-friendly.
+    Image dimensions are read once per source image (to clamp padded bboxes);
+    the pixels themselves are read lazily at training time.
     """
     anno_file = WIDER_FACE_DIR / 'wider_face_train_bbx_gt.txt'
     img_root  = WIDER_FACE_DIR / 'images'
@@ -189,19 +192,29 @@ def load_wider_face_crops(max_crops: int = 30_000) -> list:
     if not anno_file.exists() or not img_root.exists():
         return []
 
-    crops  = []
+    out = []
     with open(anno_file) as f:
         lines = [l.strip() for l in f if l.strip()]
 
     i = 0
-    while i < len(lines) and len(crops) < max_crops:
+    while i < len(lines) and len(out) < max_crops:
         rel_path  = lines[i]; i += 1
         if i >= len(lines):
             break
         num_faces = int(lines[i]); i += 1
 
         img_path = img_root / rel_path
-        img_bgr  = cv2.imread(str(img_path)) if img_path.exists() else None
+        if not img_path.exists():
+            # Still need to advance past the face lines for this image
+            i += num_faces
+            continue
+
+        # Read dimensions only (fast; PIL loads header without pixels)
+        try:
+            iw, ih = Image.open(img_path).size
+        except Exception:
+            i += num_faces
+            continue
 
         for _ in range(num_faces):
             if i >= len(lines):
@@ -211,12 +224,11 @@ def load_wider_face_crops(max_crops: int = 30_000) -> list:
             invalid    = parts[7] if len(parts) > 7 else 0
             occlusion  = parts[8] if len(parts) > 8 else 0
 
-            if img_bgr is None or invalid == 1 or occlusion == 2:
+            if invalid == 1 or occlusion == 2:
                 continue
             if w < 20 or h < 20:   # skip tiny annotations (noise)
                 continue
 
-            ih, iw = img_bgr.shape[:2]
             # Add 20 % margin so crop includes forehead and chin
             pad_x, pad_y = int(w * 0.20), int(h * 0.20)
             x1 = max(x - pad_x, 0);       y1 = max(y - pad_y, 0)
@@ -224,15 +236,12 @@ def load_wider_face_crops(max_crops: int = 30_000) -> list:
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            crop_bgr = img_bgr[y1:y2, x1:x2]
-            if crop_bgr.size == 0:
-                continue
-            crops.append(Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)))
+            out.append((str(img_path), (x1, y1, x2, y2)))
 
-            if len(crops) >= max_crops:
+            if len(out) >= max_crops:
                 break
 
-    return crops
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,53 +292,61 @@ def make_scaled_samples(face_imgs: list, bg_patches: list) -> list:
 # Step 1b: Build the (image, label) sample list
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_samples(annotations: dict, hard_negs: list = None):
+def build_samples(annotations: dict, hard_neg_paths: list = None):
     """
-    Assemble all (PIL_image, label) pairs for training.
-    Label 1 = face,  Label 0 = background.
+    Assemble all (path, label, bbox) tuples for training. Label 1 = face,
+    label 0 = background. `bbox` is either None (use the whole image) or
+    (x1, y1, x2, y2) pixel coords to crop inside the source image.
 
-    Positives come from:
-      • photos_all_faces/ — pre-cropped DnHFaces images
-      • Haar-annotated crops from full scenes
-      • LFW/ — 13k diverse faces (run download_datasets.py)
-      • WIDER FACE — 390k faces at varying scales/distances (run download_datasets.py --wider)
-      • Scale-augmented synthetics — each face resized to 20/33/50/70 % of the patch
-        to simulate how it looks at 1×, 2×, 3×, 5× the detection distance.
+    Images are never decoded here — FacePatchDataset.__getitem__ reads and
+    crops them on demand. This lets RAM scale with *sample count*, not
+    *pixel data*, so caps (CELEBA_MAX, FAIRFACE_MAX, etc.) are optional.
 
-    Negatives come from:
-      • Random crops from full scenes not overlapping any face
-      • Hard negatives from Phase-2 mining (passed in as hard_negs)
+    Positive sources:
+      • DnHFaces `photos_all_faces/` — pre-cropped thumbnails (whole file).
+      • DnHFaces `photos_all/` + Haar bboxes — crop inside full scene image.
+      • LFW, CelebA, UTKFace, FairFace — each file is already a tight crop.
+      • WIDER FACE full set (if present) — bbox inside full source image.
+      • `wider_face_crops/` — standalone flat crop files.
+    Negative sources:
+      • Random non-overlapping crops from DnHFaces scenes.
+      • Hard negatives mined in Phase 2, persisted to
+        `checkpoints/hard_neg_cache/` and supplied as a path list.
     """
     random.seed(42)
-    samples  = []
-    bg_patches = []   # collected below, used for scale augmentation compositing
+    samples = []
 
-    # ── Positives: DnHFaces pre-cropped faces ─────────────────────────────
-    dnhfaces = []
+    def _take(paths, max_n):
+        """Shuffle and optionally cap a list of paths. Skip cap if max_n is None."""
+        lst = list(paths)
+        random.shuffle(lst)
+        return lst if max_n is None else lst[:max_n]
+
+    # ── Positives: DnHFaces pre-cropped faces ────────────────────────────────
+    dnh_n = 0
     for p in FACES_DIR.glob('*.jpg'):
-        img = Image.open(p).convert('RGB')
-        samples.append((img, 1))
-        dnhfaces.append(img)
+        samples.append((str(p), 1, None))
+        dnh_n += 1
+    if dnh_n:
+        print(f'  + {dnh_n:,} DnHFaces pre-cropped positives')
 
-    # ── Positives + easy negatives from full-scene images ──────────────────
-    scene_faces = []
+    # ── Scene positives + scene-derived random negatives ─────────────────────
+    scene_pos = scene_neg = 0
     for fname, boxes in annotations.items():
         full_path = PHOTOS_ALL_DIR / fname
         if not full_path.exists():
             continue
-        img_bgr = cv2.imread(str(full_path))
-        if img_bgr is None:
+        # Image dims via header read (no pixel decode)
+        try:
+            w, h = Image.open(full_path).size
+        except Exception:
             continue
-        h, w    = img_bgr.shape[:2]
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        full_path_s = str(full_path)
 
         for (x1, y1, x2, y2) in boxes:
             if x2 > x1 and y2 > y1:
-                crop = img_rgb[y1:y2, x1:x2]
-                if crop.size > 0:
-                    pil = Image.fromarray(crop)
-                    samples.append((pil, 1))
-                    scene_faces.append(pil)
+                samples.append((full_path_s, 1, (x1, y1, x2, y2)))
+                scene_pos += 1
 
         if not boxes:
             continue
@@ -342,114 +359,73 @@ def build_samples(annotations: dict, hard_negs: list = None):
             ry1 = random.randint(0, max(0, h-sz-1))
             rx2 = rx1 + sz; ry2 = ry1 + sz
             if not any(iou([rx1, ry1, rx2, ry2], b) > IOU_THRESH for b in boxes):
-                crop = img_rgb[ry1:ry2, rx1:rx2]
-                if crop.size > 0:
-                    pil = Image.fromarray(crop).resize(
-                            (DETECTOR_PATCH_SIZE, DETECTOR_PATCH_SIZE))
-                    samples.append((pil, 0))
-                    bg_patches.append(pil)   # reuse as background for scale aug
-                    neg_added += 1
+                samples.append((full_path_s, 0, (rx1, ry1, rx2, ry2)))
+                neg_added += 1
+                scene_neg += 1
+    if scene_pos or scene_neg:
+        print(f'  + {scene_pos:,} scene positives, {scene_neg:,} scene random negatives')
 
-    # ── Positives: LFW diverse faces ──────────────────────────────────────
-    lfw_faces = []
+    # ── Positives: LFW ───────────────────────────────────────────────────────
     if LFW_DIR.exists():
-        lfw_imgs = list(LFW_DIR.glob('**/*.jpg'))
-        for p in lfw_imgs:
-            try:
-                img = Image.open(p).convert('RGB')
-                samples.append((img, 1))
-                lfw_faces.append(img)
-            except Exception:
-                pass
-        print(f'  + {len(lfw_faces):,} LFW positives')
+        lfw_paths = list(LFW_DIR.glob('**/*.jpg'))
+        for p in lfw_paths:
+            samples.append((str(p), 1, None))
+        print(f'  + {len(lfw_paths):,} LFW positives')
     else:
         print('  (LFW not found — run  python download_datasets.py)')
 
-    # ── Positives: CelebA aligned faces (200k, capped) ────────────────────
-    celeba_faces = []
+    # ── Positives: CelebA aligned faces ──────────────────────────────────────
     if CELEBA_DIR.exists():
-        celeba_imgs = list(CELEBA_DIR.glob('*.jpg'))
-        random.shuffle(celeba_imgs)
-        for p in celeba_imgs[:CELEBA_MAX]:
-            try:
-                celeba_faces.append(Image.open(p).convert('RGB'))
-            except Exception:
-                pass
-        for img in celeba_faces:
-            samples.append((img, 1))
-        print(f'  + {len(celeba_faces):,} CelebA positives')
+        celeba_paths = _take(CELEBA_DIR.glob('*.jpg'), CELEBA_MAX)
+        for p in celeba_paths:
+            samples.append((str(p), 1, None))
+        print(f'  + {len(celeba_paths):,} CelebA positives')
     else:
         print('  (CelebA not found — run: '
               'kaggle datasets download -d jessicali9530/celeba-dataset '
               '-p datasets/tmp_celeba --unzip)')
 
-    # ── Positives: UTKFace (23k, broad demographic spread) ────────────────
-    utk_faces = []
+    # ── Positives: UTKFace (broad demographic spread) ────────────────────────
     if UTKFACE_DIR.exists():
-        utk_imgs = list(UTKFACE_DIR.glob('*.jpg'))
-        random.shuffle(utk_imgs)
-        for p in utk_imgs[:UTKFACE_MAX]:
-            try:
-                utk_faces.append(Image.open(p).convert('RGB'))
-            except Exception:
-                pass
-        for img in utk_faces:
-            samples.append((img, 1))
-        print(f'  + {len(utk_faces):,} UTKFace positives')
+        utk_paths = _take(UTKFACE_DIR.glob('*.jpg'), UTKFACE_MAX)
+        for p in utk_paths:
+            samples.append((str(p), 1, None))
+        print(f'  + {len(utk_paths):,} UTKFace positives')
     else:
         print('  (UTKFace not found — run  python download_datasets.py --utk)')
 
-    # ── Positives: FairFace (108k, balanced across 7 race groups) ─────────
-    fair_faces = []
+    # ── Positives: FairFace (demographically balanced) ───────────────────────
     if FAIRFACE_DIR.exists():
-        fair_imgs = list(FAIRFACE_DIR.rglob('*.jpg'))
-        random.shuffle(fair_imgs)
-        for p in fair_imgs[:FAIRFACE_MAX]:
-            try:
-                fair_faces.append(Image.open(p).convert('RGB'))
-            except Exception:
-                pass
-        for img in fair_faces:
-            samples.append((img, 1))
-        print(f'  + {len(fair_faces):,} FairFace positives')
+        fair_paths = _take(FAIRFACE_DIR.rglob('*.jpg'), FAIRFACE_MAX)
+        for p in fair_paths:
+            samples.append((str(p), 1, None))
+        print(f'  + {len(fair_paths):,} FairFace positives')
     else:
         print('  (FairFace not found — run  python download_datasets.py --fairface '
               'for manual instructions)')
 
-    # ── Positives: WIDER FACE crops (diverse scales / real-world distances) ──
-    wider_faces = load_wider_face_crops(max_crops=30_000)
-    # Also load flat pre-extracted crops if present
+    # ── Positives: WIDER FACE crops (diverse scales) ─────────────────────────
+    wider_tuples = load_wider_face_crops(max_crops=30_000)   # (path, bbox)
+    wider_n = 0
+    for path, bbox in wider_tuples:
+        samples.append((path, 1, bbox))
+        wider_n += 1
     if WIDER_FACE_CROPS_DIR.exists():
         for p in WIDER_FACE_CROPS_DIR.glob('*.jpg'):
-            try:
-                wider_faces.append(Image.open(p).convert('RGB'))
-            except Exception:
-                pass
-    if wider_faces:
-        for img in wider_faces:
-            samples.append((img, 1))
-        print(f'  + {len(wider_faces):,} WIDER FACE positives')
+            samples.append((str(p), 1, None))
+            wider_n += 1
+    if wider_n:
+        print(f'  + {wider_n:,} WIDER FACE positives')
     else:
         print('  (WIDER FACE not found — run  python download_datasets.py --wider)')
 
-    # ── Scale augmentation — critical for distance robustness ─────────────
-    # Teach the model to recognise faces that appear SMALL in the window
-    # (i.e. the person is far from the camera).
-    all_face_imgs = dnhfaces + scene_faces + lfw_faces[:3000] + wider_faces[:5000]
-    # Scale augmentation disabled — it was teaching the detector to fire on
-    # plain backgrounds (walls, empty space) because the composited mini-faces
-    # were often indistinguishable from background texture after downsampling.
-    # _ = make_scaled_samples(all_face_imgs, bg_patches)
-    # samples.extend(_)
-    # print(f'  + {len(_):,} scale-augmented positives (disabled)')
+    # ── Hard negatives (passed in as paths, already persisted to disk) ───────
+    if hard_neg_paths:
+        for p in hard_neg_paths:
+            samples.append((str(p), 0, None))
 
-    # ── Hard negatives from mining ─────────────────────────────────────────
-    if hard_negs:
-        for img in hard_negs:
-            samples.append((img, 0))
-
-    pos = sum(1 for _, l in samples if l == 1)
-    neg = sum(1 for _, l in samples if l == 0)
+    pos = sum(1 for _, l, _ in samples if l == 1)
+    neg = sum(1 for _, l, _ in samples if l == 0)
     print(f'Dataset: {pos:,} positives, {neg:,} negatives  ({len(samples):,} total)')
     return samples
 
@@ -461,18 +437,31 @@ def build_samples(annotations: dict, hard_negs: list = None):
 @torch.no_grad()
 def mine_hard_negatives(model, annotations: dict, device) -> list:
     """
-    Slide the current model over full-scene images.
-    Collect patches where the model fires but there is no real face —
-    these are false positives that look face-like and make hard training examples.
+    Slide the current model over full-scene images. Collect patches where the
+    model fires but there is no real face — face-like false positives.
+
+    Each mined patch is persisted to HARD_NEG_CACHE_DIR as a JPG so the
+    lazy-loading Dataset can reference it by path. The previous cache (if
+    any) is cleared first to avoid stale negatives from earlier runs.
+
+    Returns a list of string paths.
     """
     print('Mining hard negatives ...')
     model.eval()
-    hard_negs = []
+
+    # Wipe any previous cache — old hard negs might not match this detector
+    if HARD_NEG_CACHE_DIR.exists():
+        for old in HARD_NEG_CACHE_DIR.glob('*.jpg'):
+            try: old.unlink()
+            except OSError: pass
+    HARD_NEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    out_paths: list = []
     imgs = sorted(PHOTOS_ALL_DIR.glob('*.JPG'))
     random.shuffle(imgs)
 
     for p in tqdm(imgs, desc='Mining'):
-        if len(hard_negs) >= MAX_HARD_NEGS:
+        if len(out_paths) >= MAX_HARD_NEGS:
             break
         img_bgr = cv2.imread(str(p))
         if img_bgr is None:
@@ -512,13 +501,18 @@ def mine_hard_negatives(model, annotations: dict, device) -> list:
             if score >= MINE_THRESH:
                 if not any(iou([x1, y1, x2, y2], b) > IOU_THRESH for b in scaled_boxes):
                     crop_np = img_rgb[y1:y2, x1:x2]
-                    if crop_np.size > 0:
-                        hard_negs.append(Image.fromarray(crop_np))
-                        if len(hard_negs) >= MAX_HARD_NEGS:
-                            break
+                    if crop_np.size == 0:
+                        continue
+                    out_file = HARD_NEG_CACHE_DIR / f'hn_{len(out_paths):06d}.jpg'
+                    # Save as BGR via cv2 to skip a PIL detour
+                    cv2.imwrite(str(out_file),
+                                cv2.cvtColor(crop_np, cv2.COLOR_RGB2BGR))
+                    out_paths.append(str(out_file))
+                    if len(out_paths) >= MAX_HARD_NEGS:
+                        break
 
-    print(f'Mined {len(hard_negs):,} hard negatives')
-    return hard_negs
+    print(f'Mined {len(out_paths):,} hard negatives (persisted to {HARD_NEG_CACHE_DIR})')
+    return out_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,6 +520,13 @@ def mine_hard_negatives(model, annotations: dict, device) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FacePatchDataset(Dataset):
+    """
+    Lazy-loading dataset. Each sample is a (path, label, bbox) tuple stored
+    as-is in the `samples` list. Images are decoded per __getitem__ call, so
+    RAM usage scales with sample *count* (megabytes) rather than decoded
+    pixels (gigabytes). DataLoader workers fork-copy only metadata.
+    """
+
     def __init__(self, samples, transform):
         self.samples   = samples
         self.transform = transform
@@ -534,8 +535,27 @@ class FacePatchDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img, label = self.samples[idx]
-        return self.transform(img), torch.tensor(label, dtype=torch.float32)
+        path, label, bbox = self.samples[idx]
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            # Return a grey fallback so training can't crash on a single bad file
+            zero = torch.zeros(3, DETECTOR_PATCH_SIZE, DETECTOR_PATCH_SIZE,
+                               dtype=torch.float32)
+            return zero, torch.tensor(label, dtype=torch.float32)
+
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            h, w = img_bgr.shape[:2]
+            x1 = max(x1, 0); y1 = max(y1, 0)
+            x2 = min(x2, w); y2 = min(y2, h)
+            if x2 <= x1 or y2 <= y1:
+                zero = torch.zeros(3, DETECTOR_PATCH_SIZE, DETECTOR_PATCH_SIZE,
+                                   dtype=torch.float32)
+                return zero, torch.tensor(label, dtype=torch.float32)
+            img_bgr = img_bgr[y1:y2, x1:x2]
+
+        pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        return self.transform(pil), torch.tensor(label, dtype=torch.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -641,8 +661,8 @@ def train(resume_from_phase1: bool = False):
     else:
         # Phase 1: bootstrap
         print('\nBuilding Phase-1 dataset ...')
-        samples = build_samples(annotations, hard_negs=None)
-        labels  = [l for _, l in samples]
+        samples = build_samples(annotations, hard_neg_paths=None)
+        labels  = [l for _, l, _ in samples]
         tr_idx, va_idx = train_test_split(range(len(samples)), test_size=0.15,
                                           random_state=42, stratify=labels)
         run_training(model,
@@ -661,7 +681,7 @@ def train(resume_from_phase1: bool = False):
         model.load_state_dict(ckpt['model'])
 
     # Phase 2: hard negative mining + retrain (from-scratch weights)
-    hard_negs = mine_hard_negatives(model, annotations, device)
+    hard_neg_paths = mine_hard_negatives(model, annotations, device)
 
     # Free the Phase-1 model before loading Phase-2 data
     del model
@@ -670,8 +690,8 @@ def train(resume_from_phase1: bool = False):
         torch.cuda.empty_cache()
 
     print('\nBuilding Phase-2 dataset ...')
-    samples2 = build_samples(annotations, hard_negs=hard_negs)
-    labels2  = [l for _, l in samples2]
+    samples2 = build_samples(annotations, hard_neg_paths=hard_neg_paths)
+    labels2  = [l for _, l, _ in samples2]
     tr_idx2, va_idx2 = train_test_split(range(len(samples2)), test_size=0.15,
                                         random_state=42, stratify=labels2)
 

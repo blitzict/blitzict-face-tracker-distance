@@ -54,18 +54,18 @@ class FaceDetectorCNN(nn.Module):
             block(  3,  32),   # 96 → 48
             block( 32,  64),   # 48 → 24
             block( 64, 128),   # 24 → 12
-            block(128, 192),   # 12 → 6
-            block(192, 256),   #  6 → 3
+            block(128, 256),   # 12 → 6
+            block(256, 384),   #  6 → 3
             nn.AdaptiveAvgPool2d(1),   # → 1×1
         )
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(384, 192),
+            nn.BatchNorm1d(192),
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(128, 1),        # raw logit; BCEWithLogitsLoss
+            nn.Linear(192, 1),        # raw logit; BCEWithLogitsLoss
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

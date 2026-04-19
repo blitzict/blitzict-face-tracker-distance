@@ -40,7 +40,10 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-from facetrack.landmarks import LandmarkCNN, LANDMARK_TRAIN_TF, LANDMARK_INFER_TF
+from facetrack.landmarks import (
+    LandmarkCNN, LANDMARK_TRAIN_TF, LANDMARK_INFER_TF,
+    flip_landmarks_horizontal,
+)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 WIDER_DIR        = Path('datasets/tmp_wider')
@@ -223,11 +226,15 @@ class LandmarkDataset(Dataset):
     Lazy-loading dataset.  Each entry is metadata only
     (source, image_path, bbox_or_None, absolute_eye_xy_xy).
     Images are read from disk per __getitem__ call — prevents memory bloat.
+
+    Horizontal-flip augmentation (train only) is applied here so the 5-point
+    label vector can be mirrored + swapped in sync with the image.
     """
 
-    def __init__(self, samples, transform):
+    def __init__(self, samples, transform, flip_prob: float = 0.0):
         self.samples   = samples
         self.transform = transform
+        self.flip_prob = flip_prob
 
     def __len__(self):
         return len(self.samples)
@@ -267,6 +274,13 @@ class LandmarkDataset(Dataset):
         normed = [min(max(v, 0.0), 1.0) for v in normed]
 
         pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
+        # Horizontal flip augmentation (train only). Has to happen here so the
+        # label coordinates stay consistent with the pixels.
+        if self.flip_prob > 0 and random.random() < self.flip_prob:
+            pil = pil.transpose(Image.FLIP_LEFT_RIGHT)
+            normed = flip_landmarks_horizontal(normed)
+
         return self.transform(pil), torch.tensor(normed, dtype=torch.float32)
 
 
@@ -294,8 +308,8 @@ def train():
     tr_raw = samples[n_val:]
     va_raw = samples[:n_val]
 
-    tr_ds = LandmarkDataset(tr_raw, LANDMARK_TRAIN_TF)
-    va_ds = LandmarkDataset(va_raw, LANDMARK_INFER_TF)
+    tr_ds = LandmarkDataset(tr_raw, LANDMARK_TRAIN_TF, flip_prob=0.5)
+    va_ds = LandmarkDataset(va_raw, LANDMARK_INFER_TF, flip_prob=0.0)
 
     tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
                            num_workers=NUM_WORKERS, pin_memory=True,
