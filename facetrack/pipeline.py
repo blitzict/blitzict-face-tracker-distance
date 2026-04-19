@@ -51,7 +51,7 @@ from facetrack.filters   import (
 
 @torch.no_grad()
 def extract_patches(frame_t: torch.Tensor, scales: list, stride_ratio: float,
-                     patch_size: int):
+                     patch_size: int, roi=None):
     """
     Build the full batch of sliding-window crops in GPU-friendly form.
 
@@ -63,6 +63,10 @@ def extract_patches(frame_t: torch.Tensor, scales: list, stride_ratio: float,
         scales        : list of scales ∈ (0, 1]; window_size = scale × min(H, W).
         stride_ratio  : stride = window_size × stride_ratio.
         patch_size    : model input size (e.g. 64).
+        roi           : optional (x1, y1, x2, y2) in frame-tensor coords. When
+                        set, only windows whose CENTERS fall inside the ROI
+                        are kept. Used for ROI-constrained detection once a
+                        track is locked.
 
     Returns
         patches : [N, 3, patch_size, patch_size] on the same device as frame_t.
@@ -80,6 +84,12 @@ def extract_patches(frame_t: torch.Tensor, scales: list, stride_ratio: float,
         crops, scale_metas = [], []
         for y in range(0, H - wsz + 1, stride):
             for x in range(0, W - wsz + 1, stride):
+                if roi is not None:
+                    cx = x + wsz // 2
+                    cy = y + wsz // 2
+                    rx1, ry1, rx2, ry2 = roi
+                    if not (rx1 <= cx < rx2 and ry1 <= cy < ry2):
+                        continue
                 crops.append(frame_t[:, y:y + wsz, x:x + wsz])
                 scale_metas.append((x, y, x + wsz, y + wsz))
         if not crops:
@@ -200,9 +210,15 @@ class DetectionWorker:
     def stop(self) -> None:
         self._running = False
 
-    def submit(self, frame: np.ndarray) -> None:
+    def submit(self, frame: np.ndarray, roi=None) -> None:
+        """
+        Enqueue a frame for processing. `roi` is an optional (x1, y1, x2, y2)
+        in the ORIGINAL frame's pixel coords — when set, the sliding window
+        only scans inside that region (faster, and kills distant-background
+        false positives once a track is locked).
+        """
         try:
-            self._q.put_nowait(frame)
+            self._q.put_nowait((frame, roi))
         except queue.Full:
             pass   # drop — the display must never block on inference
 
@@ -213,17 +229,17 @@ class DetectionWorker:
     def _loop(self) -> None:
         while self._running:
             try:
-                frame = self._q.get(timeout=0.05)
+                frame, roi = self._q.get(timeout=0.05)
             except queue.Empty:
                 continue
-            dets = self._process(frame)
+            dets = self._process(frame, roi_full=roi)
             with self._lock:
                 self._results = dets
 
     # ------------------------------------------------------------- processing
 
     @torch.no_grad()
-    def _process(self, frame_bgr: np.ndarray) -> List[dict]:
+    def _process(self, frame_bgr: np.ndarray, roi_full=None) -> List[dict]:
         H_orig, W_orig = frame_bgr.shape[:2]
 
         # ── Stage 1: detect on a small downscale ─────────────────────────────
@@ -232,7 +248,26 @@ class DetectionWorker:
         t = torch.from_numpy(rgb_small).float().permute(2, 0, 1).div(255.0)
         t = ((t - 0.5) / 0.5).to(self.device)
 
-        patches, meta = extract_patches(t, DET_SCALES, DET_STRIDE, DETECTOR_PATCH_SIZE)
+        # Map ROI (original-frame coords) into detection-frame coords, and
+        # filter the scale pyramid so we only scan scales that plausibly
+        # match the locked face size. Cuts compute when already tracking.
+        sx_d, sy_d = DET_W / W_orig, DET_H / H_orig
+        if roi_full is not None:
+            rx1, ry1, rx2, ry2 = roi_full
+            roi_det = (int(rx1 * sx_d), int(ry1 * sy_d),
+                       int(rx2 * sx_d), int(ry2 * sy_d))
+            # Rough face size in detection frame = ROI width / expand-factor (~2.5)
+            face_px_det = max((roi_det[2] - roi_det[0]) // 2, 1)
+            scales_used = [s for s in DET_SCALES
+                           if 0.35 * face_px_det <= int(min(DET_H, DET_W) * s) <= 1.8 * face_px_det]
+            if not scales_used:     # sanity fallback
+                scales_used = DET_SCALES
+        else:
+            roi_det     = None
+            scales_used = DET_SCALES
+
+        patches, meta = extract_patches(t, scales_used, DET_STRIDE,
+                                        DETECTOR_PATCH_SIZE, roi=roi_det)
         if patches is None:
             return []
 
