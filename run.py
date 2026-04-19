@@ -93,7 +93,8 @@ def run(camera_idx: int   = 0,
         det_ckpt:   str   = 'checkpoints/face_detector.pth',
         lmk_ckpt:   str   = 'checkpoints/landmark_net.pth',
         det_thresh: float = DET_THRESH,
-        focal_px:   float = 0.0) -> None:
+        focal_px:   float = 0.0,
+        fps:        int   = 60) -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device        : {device}")
@@ -121,7 +122,13 @@ def run(camera_idx: int   = 0,
         raise RuntimeError(f"Cannot open camera {camera_idx}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    # Actual fps may be less if the webcam / driver doesn't support the
+    # requested rate at this resolution — OpenCV silently falls back.
+    actual_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    print(f"Camera        : {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps:.0f} fps "
+          f"(requested {fps})")
 
     print("Running — Q/Esc quit, S screenshot, C calibrate @ 1.0 m")
 
@@ -223,13 +230,16 @@ def main() -> None:
                    help='Detector sigmoid threshold (default 0.40)')
     p.add_argument('--focal',      type=float, default=0.0,
                    help='Camera focal (px). 0 = auto-estimate. Press C at 1.0m to calibrate.')
+    p.add_argument('--fps',        type=int,   default=60,
+                   help='Requested camera fps. Actual depends on hardware support.')
     args = p.parse_args()
 
     run(camera_idx = args.camera,
         det_ckpt   = args.det_ckpt,
         lmk_ckpt   = args.lmk_ckpt,
         det_thresh = args.det_thresh,
-        focal_px   = args.focal)
+        focal_px   = args.focal,
+        fps        = args.fps)
 
 
 if __name__ == '__main__':
