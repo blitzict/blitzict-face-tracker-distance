@@ -94,8 +94,37 @@ class SingleFaceTracker:
         best_i = int(np.argmin(dists))
 
         if dists[best_i] > self.MAX_DISTANCE:
-            # Nothing close — keep current box, age it
+            # Closest detection is too far to be the same face. Age the
+            # current track, but also accumulate a re-lock candidate at
+            # the distant detection's position. If it confirms for
+            # LOCK_CONFIRM consecutive frames, abandon the (probably
+            # wrong) current lock immediately rather than coasting all
+            # the way to MAX_DISAPPEARED.
             self.age += 1
+
+            new    = detections[best_i]
+            cx, cy = cents[best_i]
+            if self.candidate is None:
+                self.candidate = {**new, 'cx': cx, 'cy': cy}
+                self.cand_hits = 1
+            else:
+                dx = cx - self.candidate['cx']
+                dy = cy - self.candidate['cy']
+                if float(np.hypot(dx, dy)) < self.MAX_DISTANCE:
+                    self.cand_hits += 1
+                    self.candidate = {**new, 'cx': cx, 'cy': cy}
+                    if self.cand_hits >= self.LOCK_CONFIRM:
+                        # Re-lock: jump to the new position
+                        self.track     = self.candidate
+                        self.dist_q    = [self.track['dist']]
+                        self.age       = 0
+                        self.candidate, self.cand_hits = None, 0
+                        return [self.track]
+                else:
+                    # Re-lock candidate itself drifted — restart accumulation
+                    self.candidate = {**new, 'cx': cx, 'cy': cy}
+                    self.cand_hits = 1
+
             if self.age > self.MAX_DISAPPEARED:
                 self._reset_all()
                 return []
