@@ -112,11 +112,16 @@ def _open_camera(camera_idx: int, fps: int, backend: str):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, fps)
-        ok, _ = cap.read()
-        if not ok:
-            cap.release()
-            return None
-        return cap
+        # Warmup + content check. Some backends "open" fine but return
+        # all-black frames because they can't actually stream at the
+        # requested mode. A real camera frame has pixel std > ~3; black /
+        # solid-colour frames have std ≈ 0.
+        for _ in range(15):
+            ok, f = cap.read()
+            if ok and f is not None and f.std() > 3.0:
+                return cap
+        cap.release()
+        return None
 
     # Try the user's choice first, then the sensible fallback
     order = [backend_map[backend]]
