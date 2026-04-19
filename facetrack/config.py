@@ -11,7 +11,11 @@ Grouped by subsystem:
 
 # ── Detection sliding-window ──────────────────────────────────────────────────
 DET_W, DET_H   = 320, 240             # detection resolution (downscaled)
-DET_SCALES     = [0.50, 0.33, 0.20, 0.13]  # close → far  (fraction of min(H,W))
+# Scales as fraction of min(H,W)=240. At 0.90 the window is 216 px in the
+# detection frame (~864 px in a 1280×720 original) — enough to contain a face
+# that fills most of the frame, i.e. the user very close to the camera.
+# Keep the smaller scales for far-away faces.
+DET_SCALES     = [0.90, 0.65, 0.45, 0.30, 0.20, 0.13]   # very close → very far
 DET_STRIDE     = 0.28                 # stride = window_size × this value
 DET_THRESH     = 0.40                 # sigmoid score ≥ this counts as "face patch"
 DET_MAX_FACES  = 3                    # top-K peaks to extract per frame
