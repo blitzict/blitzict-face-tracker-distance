@@ -4,7 +4,7 @@ facetrack.landmarks  —  5-point face landmark regressor
 
 Architecture
 ────────────
- Small CNN (~150k params) that takes a 64×64 face crop and predicts:
+ Small CNN (~500k params) that takes a 64×64 face crop and predicts:
      [ left_eye_xy, right_eye_xy, nose_xy, left_mouth_xy, right_mouth_xy ]
      = 10 values normalised to [0, 1] relative to the crop dimensions.
 
@@ -12,14 +12,19 @@ Why 5 landmarks?
 ────────────────
  * Eye-to-eye distance → IPD (for distance estimation)
  * Nose position relative to eye-midpoint → yaw angle
-       When the face turns sideways, nose shifts off the eye midline while
-       the eyes project closer together (IPD shrinks by cos(yaw)).
-       Knowing yaw lets us un-shrink IPD → correct distance even when the
-       user isn't facing the camera head-on.
- * Mouth corners → future pitch/roll correction; available free from CelebA.
+ * Mouth corners → mouth-width cue for multi-cue distance fusion
 
- All five are exactly what CelebA annotates, so 100k labelled samples
- come essentially for free.
+Why 64×64 (not 128×128)?
+────────────────────────
+ A 128×128 variant was tried (see git history around commit 81485cf).
+ The theoretical win — 4× more input pixels → sharper eye centres — did
+ not survive the real detection pipeline. Inference-time detector boxes
+ are sometimes much wider than the actual face, and the sharper 128×128
+ net collapses all landmarks to the crop centre in that case, failing
+ plausible_face_geometry. The 64×64 net's implicit blur from downsampling
+ was tolerant of that framing variance. Lesson: landmark training needs
+ random-scale / random-position augmentation before a larger input can
+ beat 64×64 in practice.
 """
 
 import torch
@@ -35,7 +40,7 @@ NUM_OUTPUTS         = NUM_LANDMARKS * 2     # (x, y) per landmark
 
 class LandmarkCNN(nn.Module):
     """
-    Small CNN: 64×64 face crop → 4 scalars (left_eye, right_eye).
+    Small CNN: 64×64 face crop → 10 normalised landmark coords.
 
     Output is squashed to [0, 1] with a sigmoid so it cannot predict
     positions outside the crop.
