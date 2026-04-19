@@ -110,9 +110,10 @@ def extract_patches(frame_t: torch.Tensor, scales: list, stride_ratio: float,
 # Heatmap → bounding boxes (top-K peaks)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scores_to_boxes(meta: list, scores: list, H: int, W: int) -> list:
+def scores_to_boxes(meta: list, scores: list, H: int, W: int,
+                    max_faces: int = None) -> list:
     """
-    Convert per-patch sigmoid scores into up to DET_MAX_FACES bounding boxes.
+    Convert per-patch sigmoid scores into up to `max_faces` bounding boxes.
 
     Algorithm
         1. Paint max score per pixel into a heatmap.
@@ -120,9 +121,15 @@ def scores_to_boxes(meta: list, scores: list, H: int, W: int) -> list:
         3. Gaussian-blur lightly; find top-K local maxima by iterative argmax
            + local suppression.
 
+    `max_faces` defaults to the DET_MAX_FACES config value. Override to 1
+    when tracking a known face (avoids the top-K picker jittering between
+    multiple overlapping peaks on the same face).
+
     Returns
         List of (x1, y1, x2, y2, peak_score, wsz) in detection-frame coords.
     """
+    if max_faces is None:
+        max_faces = DET_MAX_FACES
     score_map = np.zeros((H, W), dtype=np.float32)
     size_map  = np.zeros((H, W), dtype=np.float32)
 
@@ -146,7 +153,7 @@ def scores_to_boxes(meta: list, scores: list, H: int, W: int) -> list:
 
     boxes   = []
     working = blurred.copy()
-    for _ in range(DET_MAX_FACES):
+    for _ in range(max_faces):
         peak_idx    = int(np.argmax(working))
         cy, cx      = divmod(peak_idx, W)
         peak_score  = float(working[cy, cx])
@@ -210,15 +217,16 @@ class DetectionWorker:
     def stop(self) -> None:
         self._running = False
 
-    def submit(self, frame: np.ndarray, roi=None) -> None:
+    def submit(self, frame: np.ndarray, track_box=None) -> None:
         """
-        Enqueue a frame for processing. `roi` is an optional (x1, y1, x2, y2)
-        in the ORIGINAL frame's pixel coords — when set, the sliding window
-        only scans inside that region (faster, and kills distant-background
-        false positives once a track is locked).
+        Enqueue a frame for processing. `track_box` is an optional
+        (x1, y1, x2, y2) of the currently-locked face in ORIGINAL frame
+        coords. When provided, the sliding window runs in ROI+single-scale
+        mode around the box — faster, and immune to distant-background
+        false positives.
         """
         try:
-            self._q.put_nowait((frame, roi))
+            self._q.put_nowait((frame, track_box))
         except queue.Full:
             pass   # drop — the display must never block on inference
 
@@ -229,17 +237,17 @@ class DetectionWorker:
     def _loop(self) -> None:
         while self._running:
             try:
-                frame, roi = self._q.get(timeout=0.05)
+                frame, track_box = self._q.get(timeout=0.05)
             except queue.Empty:
                 continue
-            dets = self._process(frame, roi_full=roi)
+            dets = self._process(frame, track_box=track_box)
             with self._lock:
                 self._results = dets
 
     # ------------------------------------------------------------- processing
 
     @torch.no_grad()
-    def _process(self, frame_bgr: np.ndarray, roi_full=None) -> List[dict]:
+    def _process(self, frame_bgr: np.ndarray, track_box=None) -> List[dict]:
         H_orig, W_orig = frame_bgr.shape[:2]
 
         # ── Stage 1: detect on a small downscale ─────────────────────────────
@@ -248,23 +256,38 @@ class DetectionWorker:
         t = torch.from_numpy(rgb_small).float().permute(2, 0, 1).div(255.0)
         t = ((t - 0.5) / 0.5).to(self.device)
 
-        # Map ROI (original-frame coords) into detection-frame coords, and
-        # filter the scale pyramid so we only scan scales that plausibly
-        # match the locked face size. Cuts compute when already tracking.
+        # When locked: ROI around the track + single best-matching scale +
+        # top-1 peak. Eliminates the cross-scale / cross-peak jitter that
+        # makes the displayed box flicker at close range. When searching
+        # (no track_box): full pyramid and top-K, so we can find a face
+        # we don't yet know about.
         sx_d, sy_d = DET_W / W_orig, DET_H / H_orig
-        if roi_full is not None:
-            rx1, ry1, rx2, ry2 = roi_full
-            roi_det = (int(rx1 * sx_d), int(ry1 * sy_d),
-                       int(rx2 * sx_d), int(ry2 * sy_d))
-            # Rough face size in detection frame = ROI width / expand-factor (~2.5)
-            face_px_det = max((roi_det[2] - roi_det[0]) // 2, 1)
-            scales_used = [s for s in DET_SCALES
-                           if 0.35 * face_px_det <= int(min(DET_H, DET_W) * s) <= 1.8 * face_px_det]
-            if not scales_used:     # sanity fallback
-                scales_used = DET_SCALES
+        if track_box is not None:
+            bx1, by1, bx2, by2 = track_box
+            bw = max(bx2 - bx1, 1); bh = max(by2 - by1, 1)
+            # Expand 2.2x around the box for motion headroom, clamp to frame
+            cx = (bx1 + bx2) // 2; cy = (by1 + by2) // 2
+            rw = int(bw * 2.2); rh = int(bh * 2.2)
+            roi_full = (max(cx - rw // 2, 0), max(cy - rh // 2, 0),
+                        min(cx + rw // 2, W_orig - 1),
+                        min(cy + rh // 2, H_orig - 1))
+            roi_det  = (int(roi_full[0] * sx_d), int(roi_full[1] * sy_d),
+                        int(roi_full[2] * sx_d), int(roi_full[3] * sy_d))
+
+            # Face size in detection-frame coords — use the LARGER of
+            # width / height so a tall (landmark-derived) box doesn't
+            # pick a too-small window. max(bw, bh) is the clean signal.
+            face_px_det = max(int(max(bw, bh) * sx_d), 1)
+
+            # Single scale whose window size is closest to face_px_det
+            best_scale = min(DET_SCALES,
+                             key=lambda s: abs(int(min(DET_H, DET_W) * s) - face_px_det))
+            scales_used        = [best_scale]
+            max_faces_override = 1
         else:
-            roi_det     = None
-            scales_used = DET_SCALES
+            roi_det            = None
+            scales_used        = DET_SCALES
+            max_faces_override = None    # = DET_MAX_FACES default
 
         patches, meta = extract_patches(t, scales_used, DET_STRIDE,
                                         DETECTOR_PATCH_SIZE, roi=roi_det)
@@ -276,7 +299,8 @@ class DetectionWorker:
             logits = self.detector(patches[i:i + 512])
             scores.extend(torch.sigmoid(logits).cpu().tolist())
 
-        boxes_det = scores_to_boxes(meta, scores, DET_H, DET_W)
+        boxes_det = scores_to_boxes(meta, scores, DET_H, DET_W,
+                                    max_faces=max_faces_override)
         if not boxes_det:
             return []
 

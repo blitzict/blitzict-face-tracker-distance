@@ -130,30 +130,16 @@ def run(camera_idx: int   = 0,
     cal_msg  = ''
     cal_t    = 0.0
 
-    # ROI expand factor: search in a box this many times the current track's
-    # bounding box. Enough margin for normal head motion between detection
-    # updates without letting the detector see distant background regions.
-    ROI_EXPAND = 2.2
-
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Camera read failed.")
             break
 
-        # If already tracking, restrict the next detection to a region around
-        # the track — faster and kills background false positives.
-        roi = None
-        if tracker.track is not None:
-            H, W = frame.shape[:2]
-            x1, y1, x2, y2 = tracker.track['box']
-            cx = (x1 + x2) // 2; cy = (y1 + y2) // 2
-            bw = max(x2 - x1, 1); bh = max(y2 - y1, 1)
-            rw = int(bw * ROI_EXPAND); rh = int(bh * ROI_EXPAND)
-            roi = (max(cx - rw // 2, 0), max(cy - rh // 2, 0),
-                   min(cx + rw // 2, W - 1), min(cy + rh // 2, H - 1))
-
-        worker.submit(frame, roi=roi)
+        # When we have a lock, pass the track's bounding box to the worker.
+        # Worker uses it for ROI + single-scale detection (fast, stable).
+        track_box = tracker.track['box'] if tracker.track is not None else None
+        worker.submit(frame, track_box=track_box)
         tracks = tracker.update(worker.get_detections())
 
         for tr in tracks:
