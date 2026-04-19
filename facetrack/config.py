@@ -30,8 +30,7 @@ FALLBACK_FACE_W_M  = 0.145            # used if landmark model is missing
 FALLBACK_FACE_FILL = 0.65             # face fraction of detection window
 
 # ── Tracker smoothing ─────────────────────────────────────────────────────────
-TRACK_BOX_ALPHA  = 0.70               # box EMA — higher = faster reaction; 0.70 tracks
-                                      # ~90% of the gap in 3 frames (50ms at 60 fps)
+TRACK_BOX_ALPHA  = 0.45               # box EMA — higher = faster reaction
 TRACK_DIST_ALPHA = 0.30               # kept for backwards compat; main dist uses median
 
 # ── False-positive filters ────────────────────────────────────────────────────

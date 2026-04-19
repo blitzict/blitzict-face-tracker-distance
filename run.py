@@ -112,13 +112,11 @@ def _open_camera(camera_idx: int, fps: int, backend: str):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, fps)
-        # Warmup + content check. Some backends "open" fine but return
-        # all-black frames because they can't actually stream at the
-        # requested mode. A real camera frame has pixel std > ~3; black /
-        # solid-colour frames have std ≈ 0.
-        for _ in range(15):
+        # Warmup: some backends need a few reads before they return valid
+        # frames. We accept the backend as soon as any read succeeds.
+        for _ in range(10):
             ok, f = cap.read()
-            if ok and f is not None and f.std() > 3.0:
+            if ok and f is not None:
                 return cap
         cap.release()
         return None
@@ -146,7 +144,7 @@ def run(camera_idx: int   = 0,
         lmk_ckpt:   str   = 'checkpoints/landmark_net.pth',
         det_thresh: float = DET_THRESH,
         focal_px:   float = 0.0,
-        fps:        int   = 60,
+        fps:        int   = 30,
         backend:    str   = 'auto') -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -298,8 +296,9 @@ def main() -> None:
                    help='Detector sigmoid threshold (default 0.40)')
     p.add_argument('--focal',      type=float, default=0.0,
                    help='Camera focal (px). 0 = auto-estimate. Press C at 1.0m to calibrate.')
-    p.add_argument('--fps',        type=int,   default=60,
-                   help='Requested camera fps. Actual depends on hardware support.')
+    p.add_argument('--fps',        type=int,   default=30,
+                   help='Requested camera fps. Actual depends on hardware support. '
+                        'Try --fps 60 if your webcam supports it at 1280x720.')
     p.add_argument('--backend',    type=str,   default='auto',
                    choices=['auto', 'dshow', 'msmf', 'v4l2', 'any'],
                    help='Camera backend. "auto" tries DSHOW first on Windows '
