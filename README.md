@@ -1,67 +1,77 @@
 # Face Tracking + Distance Estimation
 
-Real-time face tracking and monocular distance estimation from a single webcam, built from scratch — custom face detector, custom 5-point landmark regressor, sticky single-face tracker, geometric distance from inter-pupillary distance. Runs at 30+ FPS on a modest GPU.
+Real-time face tracking and monocular distance estimation from a single webcam — custom detector, custom 5-point landmark regressor, sticky single-face tracker, geometric distance from inter-pupillary distance. Runs at 30+ FPS on a modest GPU.
 
 ```bash
 python run.py --camera 0
 ```
 
-- **Green box** locks onto your face with smooth temporal tracking.
+- **Green box** locks onto your face and glides with your motion.
 - **Distance in metres** shown live, yaw-corrected so it stays accurate when you turn your head.
 - **Press `C`** once at exactly 1 m from the camera to calibrate focal length → ~±3 % accuracy from then on.
 
-Everything is built from scratch — custom detector, custom landmark regressor, trained end-to-end on open face datasets.
-
-### What this does
-
-Face **detection** + 5-point **landmark regression** + monocular **distance estimation**, in a single real-time pipeline.
-
 ---
 
-## Pipeline
+## How it works — per frame, in plain English
 
 ```
-┌──────────────────┐
-│ Camera frame     │ 1280 × 720 BGR
-└────────┬─────────┘
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 1  FaceDetectorCNN                                               │
-│   Sliding window on a 320 × 240 downscale at 4 scales.                 │
-│   Top-K heatmap peaks → candidate boxes.                               │
-│   (~200 k params, binary face / background classifier)                 │
-└────────┬───────────────────────────────────────────────────────────────┘
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 2  LandmarkCNN                                                   │
-│   Pad candidate crop by 20 %, run CNN → 5 landmarks:                   │
-│     (left eye, right eye, nose, left mouth, right mouth)               │
-│   (~150 k params)                                                      │
-└────────┬───────────────────────────────────────────────────────────────┘
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 3  Filters  (unanimous AND gate — all three must pass)           │
-│   • Geometric plausibility of the 5 landmarks                          │
-│   • Bilateral symmetry (flipped-crop NCC)                              │
-│   • Skin-tone ratio (HSV)                                              │
-└────────┬───────────────────────────────────────────────────────────────┘
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 4  Distance                                                      │
-│   yaw   = estimated from nose offset vs eye midline                    │
-│   ipd   = measured IPD in pixels, un-foreshortened by cos(yaw)         │
-│   dist  = (0.063 m × focal_px) / ipd                                   │
-└────────┬───────────────────────────────────────────────────────────────┘
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Stage 5  SingleFaceTracker                                             │
-│   • LOCK_CONFIRM consecutive confirming frames required to lock        │
-│   • Nearest-detection match only (ignores far detections)              │
-│   • Temporal landmark-stability gate                                   │
-│   • EMA box smoothing + 7-frame median on distance                     │
-└────────┬───────────────────────────────────────────────────────────────┘
-         ▼
-      Display
+┌─ 1 ── GRAB ─────────────────────────────────────────────────────┐
+│  Pull a 1280×720 frame from the webcam. Downscale a copy to     │
+│  320×240 for detection (the detector doesn't need full res).    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ 2 ── FIND THE FACE ────────────────────────────────────────────┐
+│                                                                 │
+│  SEARCHING mode (no face locked yet):                           │
+│    Slide a window across the frame at 6 scales (big-close-up    │
+│    → tiny-far). Classify every window with the detector CNN.    │
+│    Keep the top 3 peaks above threshold.                        │
+│                                                                 │
+│  TRACKING mode (face already locked):                           │
+│    Scan only a small box around the current track, and only     │
+│    at the one scale that matches the face size. ~20 ms/frame    │
+│    and can't false-fire on distant background.                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ 3 ── LANDMARKS ────────────────────────────────────────────────┐
+│  For each candidate, pad the crop by 20% and run the landmark   │
+│  CNN. Output: 5 points — left eye, right eye, nose, left mouth, │
+│  right mouth — normalised to [0,1] inside the crop.             │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ 4 ── REJECT IMPOSTERS ─────────────────────────────────────────┐
+│  Three cheap filters; all three must pass:                      │
+│    • Geometry — eyes horizontal, nose between them, mouth below │
+│    • Symmetry — flipped crop still looks similar (NCC)          │
+│    • Skin tone — enough skin-colour pixels in HSV               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ 5 ── MEASURE DISTANCE ─────────────────────────────────────────┐
+│  yaw  = angle derived from how far the nose has shifted off     │
+│         the eye midline                                         │
+│  ipd  = pixel distance between eye centres, un-foreshortened    │
+│         by cos(yaw)                                             │
+│  dist = (0.063 m × focal_px) / ipd                              │
+│                                                                 │
+│  0.063 m is the average adult inter-pupillary distance.         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ 6 ── TRACK + SMOOTH ───────────────────────────────────────────┐
+│  The SingleFaceTracker keeps the box stable across frames:      │
+│    • Lock only after 2 consecutive confirming frames            │
+│    • Match new detections by nearest-centroid                   │
+│    • If a detection appears far from the lock for 2 frames,     │
+│      switch to it (re-lock) instead of coasting on the old one  │
+│    • EMA-smooth the box + 7-frame rolling median on distance    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                         Display frame
 ```
 
 **Why IPD instead of face width?** Inter-pupillary distance is ±3 mm across adults; face width is ±10 mm. IPD cuts cross-user distance error roughly in half and is robust to expression, hair, facial hair, glasses.
@@ -72,12 +82,21 @@ Face **detection** + 5-point **landmark regression** + monocular **distance esti
 
 | Model             | File                     | Params  | Input         | Output                                 |
 | ----------------- | ------------------------ | ------- | ------------- | -------------------------------------- |
-| `FaceDetectorCNN` | `facetrack/detector.py`  | ~1.04 M | 96 × 96 RGB   | scalar logit — face vs background      |
+| `FaceDetectorCNN` | `facetrack/detector.py`  | ~3.46 M | 96 × 96 RGB   | scalar logit — face vs background      |
 | `LandmarkCNN`     | `facetrack/landmarks.py` | ~150 k  | 64 × 64 RGB   | 10 floats — 5 (x, y) landmark coords   |
 
-Both are **custom** architectures. The detector is a 5-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks) with double conv per block and a small MLP head; the landmark net is a narrower 4-block variant of the same pattern, trained at 64×64. Detector and landmark patch sizes are decoupled: you can retrain the detector at a different resolution without invalidating the landmark checkpoint.
+Both are **custom** architectures. The detector is a 5-block conv backbone (Conv → BatchNorm → SiLU, MaxPool between blocks) with double conv per block, channels [32, 64, 128, 256, 384], and a small MLP head. The landmark net is a narrower 4-block variant of the same pattern. Detector and landmark patch sizes are decoupled, so you can retrain the detector at a different resolution without invalidating the landmark checkpoint.
 
-> **v2 upgrade note.** An earlier v1 of the detector was ~200 k params at 64×64. It overfit to the LFW + CelebA distribution and generalised poorly to arbitrary webcams / people. The v2 shipped here increases capacity 5×, moves to 96×96, and trains with much heavier augmentation + UTKFace (FairFace optional) for demographic coverage. The v1 weights are preserved for reference in `checkpoints/face_detector_v1_legacy.pth` (gitignored; recover from git history if needed).
+### How we got here
+
+| Version | Params | Input | Key change                                                                 |
+| ------- | ------ | ----- | -------------------------------------------------------------------------- |
+| v1      | ~200 k | 64×64 | LFW + CelebA only; overfit the celebrity-frontal distribution              |
+| v2      | ~1.0 M | 96×96 | Heavier augmentation + UTKFace                                             |
+| v4      | ~1.9 M | 96×96 | + FairFace (capped)                                                        |
+| **v5**  | **~3.5 M** | **96×96** | **Full uncapped data (349 k positives); lazy-loading training pipeline** |
+
+The landmark net was also retrained (v2) with horizontal-flip augmentation (labels mirrored in sync) + heavier photometric aug.
 
 ---
 
@@ -85,26 +104,16 @@ Both are **custom** architectures. The detector is a 5-block conv backbone (Conv
 
 ### Used for training
 
-| Dataset            | Role                                                  | Size       | How to obtain                                                |
-| ------------------ | ----------------------------------------------------- | ---------- | ------------------------------------------------------------ |
-| **LFW**            | Diverse face positives                                | 13 k       | `python download_datasets.py`                                |
-| **CelebA aligned** | Face positives + 5-point landmarks                    | 200 k      | `kaggle datasets download -d jessicali9530/celeba-dataset`   |
-| **WIDER FACE**     | Face positives at varied scales, occlusions, poses    | ~390 k     | `python download_datasets.py --wider`                        |
-| **UTKFace**        | Broad demographic spread (age / gender / ethnicity)   | 23 k       | `python download_datasets.py --utk`                          |
+| Dataset            | Role                                                  | Size       | How to obtain                                                  |
+| ------------------ | ----------------------------------------------------- | ---------- | -------------------------------------------------------------- |
+| **LFW**            | Diverse face positives                                | 13 k       | `python download_datasets.py`                                  |
+| **CelebA aligned** | Face positives + 5-point landmarks                    | 200 k      | `kaggle datasets download -d jessicali9530/celeba-dataset`     |
+| **WIDER FACE**     | Face positives at varied scales, occlusions, poses    | ~390 k     | `python download_datasets.py --wider`                          |
+| **UTKFace**        | Broad demographic spread (age / gender / ethnicity)   | 23 k       | `python download_datasets.py --utk`                            |
 | **FairFace**       | Demographically balanced (7 race groups × age × sex)  | 108 k      | `python download_datasets.py --fairface` (manual instructions) |
-| **Hard negatives** | False positives mined by Phase-1 detector             | ≤ 6 k      | Auto-generated during Phase-2 training                       |
+| **Hard negatives** | False positives mined by Phase-1 detector             | ≤ 6 k      | Auto-generated during Phase-2 training                         |
 
-UTKFace and FairFace were added in the v2 upgrade specifically to defeat the demographic bias baked into LFW + CelebA. Training will degrade gracefully if either (or both) are missing — you just lose the corresponding generalisation boost.
-
-### Explicitly not used — and why
-
-| Not used                   | Reason                                                                                                          |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| BIWI Kinect                | All subjects at a fixed ~0.9 m distance — no variety for distance training.                                     |
-| HRRFaceD / LRRFaceD        | "Range" in the dataset name refers to wavelength, not distance. No distance annotations.                        |
-| HPE-360                    | Fisheye-distorted — distortion would actively hurt the detector.                                                |
-| FFHQ                       | Over-curated high-res portraits. After 64 × 64 downsample, adds nothing LFW / CelebA doesn't already give.      |
-| Scale-augmented synthetics | Tried, made the detector fire on plain backgrounds. Removed.                                                    |
+Training degrades gracefully if any dataset is missing — you just lose the corresponding generalisation boost.
 
 ---
 
@@ -112,16 +121,14 @@ UTKFace and FairFace were added in the v2 upgrade specifically to defeat the dem
 
 Temporal aggregation is used; cross-model ensembling is **not**.
 
-| Layer                  | What happens                                                     | What kind of aggregation   |
-| ---------------------- | ---------------------------------------------------------------- | -------------------------- |
-| Distance readings      | 7-frame rolling median                                           | Temporal — robust to spikes |
-| Bounding box           | EMA with `TRACK_BOX_ALPHA`                                       | Temporal — smooths jitter   |
-| Track lock             | `LOCK_CONFIRM = 2` consecutive confirming frames required        | Temporal — rejects single-frame FPs |
-| Filter stage           | Geometry ∧ Symmetry ∧ Skin — **all three must pass**             | Unanimous AND, not weighted voting |
-| Multi-scale detection  | Heatmap peaks taken top-K per scale (no cross-scale fusion)      | None                        |
-| Model ensemble / TTA   | —                                                                | **None** — single detector, single forward pass per crop |
-
-Cheap future wins: weighted filter scoring instead of AND, flip-TTA on the landmark net to tighten IPD, multi-scale score fusion before top-K.
+| Layer                 | What happens                                                 | Kind                                     |
+| --------------------- | ------------------------------------------------------------ | ---------------------------------------- |
+| Distance readings     | 7-frame rolling median                                       | Temporal — robust to spikes              |
+| Bounding box          | EMA with `TRACK_BOX_ALPHA`                                   | Temporal — smooths jitter                |
+| Track lock            | 2 consecutive confirming frames required                     | Temporal — rejects single-frame FPs      |
+| Filter stage          | Geometry ∧ Symmetry ∧ Skin — all three must pass             | Unanimous AND, not weighted voting       |
+| Detection peaks       | Top-K (searching) or top-1 + single scale (tracking)         | Top-1 once locked kills cross-peak race  |
+| Model ensemble / TTA  | —                                                            | **None** — single detector, single pass  |
 
 ---
 
@@ -144,7 +151,7 @@ pip install -r requirements.txt
 python run.py --camera 0
 ```
 
-The shipped `checkpoints/face_detector.pth` is the trained v2 model — no training needed to run. If you want to rebuild it with your own data, see the Training section.
+The shipped `checkpoints/face_detector.pth` is the trained v5 model and `checkpoints/landmark_net.pth` is landmark v2 — no training needed to run.
 
 Controls while running:
 
@@ -185,9 +192,11 @@ kaggle datasets download -d jessicali9530/celeba-dataset -p datasets/tmp_celeba 
 
 ```bash
 python train_detector.py
+# or, if Phase 1 already ran and you just want to redo mining + Phase 2:
+python train_detector.py --resume-from-phase1
 ```
 
-Phase 1 bootstraps on positives + random negatives for 40 epochs. Phase 2 mines the Phase-1 model's own false positives as hard negatives and re-trains from scratch for another 40 epochs. With the v2 model (~1 M params, 96×96) and the full LFW + CelebA + WIDER + UTKFace + FairFace mix, expect ~2–3 hours on a single modern GPU.
+Phase 1 bootstraps on positives + random negatives. Phase 2 mines the Phase-1 model's own false positives as hard negatives and re-trains from scratch. Samples are stored as file-paths (lazy loaded in `__getitem__`) so RAM scales with sample *count*, not decoded pixel data — no dataset size caps needed.
 
 ### Landmark regressor
 
@@ -195,7 +204,7 @@ Phase 1 bootstraps on positives + random negatives for 40 epochs. Phase 2 mines 
 python train_landmarks.py
 ```
 
-30 epochs, ~25 s each on an RTX-class GPU. Reaches ≈ 0.003 normalised error — about **0.2 pixels on a 64 × 64 crop**.
+30 epochs with horizontal-flip + photometric augmentation. Reaches ≈ 0.0037 normalised error (~0.24 px on a 64 × 64 crop).
 
 ---
 
@@ -214,12 +223,12 @@ Remaining error is dominated by focal-length uncertainty (camera-specific) and s
 
 ## Tuning
 
-| Symptom                           | Fix                                                                                                         |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Box flickers on / off             | Already damped by tracker EMA + 45-frame persistence. If it's still flickering, lower `DET_THRESH` to 0.30. |
-| Box drifts to walls or furniture  | Raise `DET_THRESH` to 0.55+. The filters are the second line of defence.                                    |
-| Face never detected               | Lower `DET_THRESH` to 0.30. Also check `FOCAL_RATIO` / press `C` to calibrate.                              |
-| Distance off                      | Press `C` at 1.0 m. Or pass `--focal N`.                                                                    |
+| Symptom                           | Fix                                                                                                  |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Box flickers on / off             | Already damped by tracker EMA and the 2-frame lock confirm. If still flickering, lower `DET_THRESH`. |
+| Box drifts to walls or furniture  | Raise `DET_THRESH` to 0.55+. Filters are the second line of defence.                                 |
+| Face never detected               | Lower `DET_THRESH` to 0.30. Also press `C` to calibrate focal.                                       |
+| Distance off                      | Press `C` at 1.0 m. Or pass `--focal N`.                                                             |
 
 All tunables live in `facetrack/config.py`.
 
@@ -234,9 +243,9 @@ All tunables live in `facetrack/config.py`.
 ├── .gitignore
 │
 ├── run.py                         Real-time inference entry point
-├── train_detector.py              Trains FaceDetectorCNN
+├── train_detector.py              Trains FaceDetectorCNN (two-phase)
 ├── train_landmarks.py             Trains LandmarkCNN
-├── download_datasets.py           LFW + WIDER FACE downloader
+├── download_datasets.py           LFW / WIDER / UTKFace / FairFace
 │
 ├── facetrack/                     Library package
 │   ├── __init__.py
@@ -245,7 +254,7 @@ All tunables live in `facetrack/config.py`.
 │   ├── landmarks.py               LandmarkCNN architecture + transforms
 │   ├── filters.py                 Geometric + symmetry + skin FP filters
 │   ├── tracker.py                 SingleFaceTracker (sticky 1-face state machine)
-│   └── pipeline.py                Sliding window + heatmap + DetectionWorker thread
+│   └── pipeline.py                Sliding window + DetectionWorker thread
 │
 └── checkpoints/
     ├── face_detector.pth          Trained detector
@@ -256,8 +265,25 @@ All tunables live in `facetrack/config.py`.
 
 ## Design decisions
 
-- **Everything from scratch.** The whole point was to build and train every piece end-to-end on open face datasets.
-- **Top-K peaks over the detector heatmap.** Simpler than connected components; landmark plausibility + filters do the FP rejection just as well.
-- **EMA smoothing instead of Kalman.** Two multiplies per coord per frame vs. dozens, and the motion isn't complex enough to need a dynamical model.
+- **Everything from scratch.** Build and train every piece end-to-end on open face datasets.
+- **ROI + single-scale when locked.** Once the tracker has a face, the detector scans only a tight box around it at one scale — cuts compute ~15× and eliminates the distant-background false-positive class.
+- **EMA smoothing over Kalman.** Two multiplies per coord per frame vs. dozens, and head motion isn't complex enough to need a dynamical model.
 - **Single-face tracker.** The classic "box jumps to a wall" failure comes from multi-track logic treating each detection independently. A single sticky track is simpler and more robust for the one-person use case.
-- **Shipping the trained checkpoints.** They're small (~5 MB total) — cloning and running `python run.py` should just work. Training is an optional rebuild.
+- **Ship the trained checkpoints.** Small (~16 MB total). `git clone` + `python run.py` should just work.
+
+---
+
+```
+┌────────────────────────────────────────────┐
+│ C:\blitz>                                  │
+│                                            │
+│   ██████╗ ██╗     ██╗████████╗███████╗     │
+│   ██╔══██╗██║     ██║╚══██╔══╝╚══███╔╝     │
+│   ██████╔╝██║     ██║   ██║     ███╔╝      │
+│   ██╔══██╗██║     ██║   ██║    ███╔╝       │
+│   ██████╔╝███████╗██║   ██║   ███████╗     │
+│   ╚═════╝ ╚══════╝╚═╝   ╚═╝   ╚══════╝     │
+│                                            │
+│ C:\blitz> _                                │
+└────────────────────────────────────────────┘
+```
