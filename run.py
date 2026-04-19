@@ -89,63 +89,11 @@ def draw_label(frame, box, dist_m: float) -> None:
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _open_camera(camera_idx: int, fps: int, backend: str):
-    """
-    Open the camera with the requested backend, or auto-fall-back to
-    something that actually reads a frame. On Windows, MSMF (the OpenCV
-    default) sometimes fails to start streaming on USB webcams with error
-    MF_E_HW_MFT_FAILED_START_STREAMING (-1072875772); DirectShow usually
-    works in that case.
-    """
-    backend_map = {
-        'auto':  None,
-        'dshow': cv2.CAP_DSHOW,
-        'msmf':  cv2.CAP_MSMF,
-        'v4l2':  cv2.CAP_V4L2,
-        'any':   cv2.CAP_ANY,
-    }
-
-    def _try(api):
-        cap = cv2.VideoCapture(camera_idx) if api is None else cv2.VideoCapture(camera_idx, api)
-        if not cap.isOpened():
-            return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        # Warmup: some backends need a few reads before they return valid
-        # frames. We accept the backend as soon as any read succeeds.
-        for _ in range(10):
-            ok, f = cap.read()
-            if ok and f is not None:
-                return cap
-        cap.release()
-        return None
-
-    # Try the user's choice first, then the sensible fallback
-    order = [backend_map[backend]]
-    if backend == 'auto':
-        order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_V4L2, None]  # None = OpenCV default
-    else:
-        order.extend(b for b in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]
-                     if b != backend_map[backend])
-
-    for api in order:
-        cap = _try(api)
-        if cap is not None:
-            api_name = {cv2.CAP_DSHOW: 'DSHOW', cv2.CAP_MSMF: 'MSMF',
-                        cv2.CAP_V4L2: 'V4L2', cv2.CAP_ANY: 'ANY',
-                        None: 'default'}.get(api, str(api))
-            return cap, api_name
-    return None, None
-
-
 def run(camera_idx: int   = 0,
         det_ckpt:   str   = 'checkpoints/face_detector.pth',
         lmk_ckpt:   str   = 'checkpoints/landmark_net.pth',
         det_thresh: float = DET_THRESH,
-        focal_px:   float = 0.0,
-        fps:        int   = 30,
-        backend:    str   = 'auto') -> None:
+        focal_px:   float = 0.0) -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device        : {device}")
@@ -167,17 +115,13 @@ def run(camera_idx: int   = 0,
 
     tracker = SingleFaceTracker()
 
-    cap, api_name = _open_camera(camera_idx, fps, backend)
-    if cap is None:
+    cap = cv2.VideoCapture(camera_idx)
+    if not cap.isOpened():
         worker.stop()
-        raise RuntimeError(
-            f"Cannot open camera {camera_idx} with any backend. Another app "
-            f"may be using it, or the index may be wrong. Try --camera 0."
-        )
-    actual_fps = cap.get(cv2.CAP_PROP_FPS) or 0
-    print(f"Camera        : {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps:.0f} fps "
-          f"(backend={api_name}, requested {fps})")
+        raise RuntimeError(f"Cannot open camera {camera_idx}")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     print("Running — Q/Esc quit, S screenshot, C calibrate @ 1.0 m")
 
@@ -296,22 +240,13 @@ def main() -> None:
                    help='Detector sigmoid threshold (default 0.40)')
     p.add_argument('--focal',      type=float, default=0.0,
                    help='Camera focal (px). 0 = auto-estimate. Press C at 1.0m to calibrate.')
-    p.add_argument('--fps',        type=int,   default=30,
-                   help='Requested camera fps. Actual depends on hardware support. '
-                        'Try --fps 60 if your webcam supports it at 1280x720.')
-    p.add_argument('--backend',    type=str,   default='auto',
-                   choices=['auto', 'dshow', 'msmf', 'v4l2', 'any'],
-                   help='Camera backend. "auto" tries DSHOW first on Windows '
-                        '(most reliable for USB webcams), then MSMF, V4L2, default.')
     args = p.parse_args()
 
     run(camera_idx = args.camera,
         det_ckpt   = args.det_ckpt,
         lmk_ckpt   = args.lmk_ckpt,
         det_thresh = args.det_thresh,
-        focal_px   = args.focal,
-        fps        = args.fps,
-        backend    = args.backend)
+        focal_px   = args.focal)
 
 
 if __name__ == '__main__':
