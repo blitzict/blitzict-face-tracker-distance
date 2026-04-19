@@ -196,12 +196,17 @@ class DetectionWorker:
     def __init__(self, detector: FaceDetectorCNN, device: torch.device,
                  det_thresh: float = DET_THRESH,
                  focal_px: Optional[float] = None,
-                 landmark_net: Optional[LandmarkCNN] = None):
+                 landmark_net: Optional[LandmarkCNN] = None,
+                 ipd_m: float = IPD_METRES):
         self.detector     = detector
         self.device       = device
         self.det_thresh   = det_thresh
         self.focal_px     = focal_px         # None ⇒ auto-estimate per frame
         self.landmark_net = landmark_net
+        # Per-user IPD override. Default is the 0.063 m adult population
+        # average; an individual's real IPD is ±3 mm away, and using the
+        # user's measured IPD removes up to ~5% of distance-accuracy bias.
+        self.ipd_m        = float(ipd_m)
 
         self._q       = queue.Queue(maxsize=1)
         self._lock    = threading.Lock()
@@ -399,8 +404,10 @@ class DetectionWorker:
                 x1, y1, x2, y2 = tx1, ty1, tx2, ty2
 
         # ── Distance from IPD (or fallback geometric formula) ────────────────
+        # Uses self.ipd_m (per-user configurable) rather than the population
+        # average IPD_METRES — lets users remove ~±5% bias by passing --ipd.
         if ipd_px and ipd_px > 4:
-            dist_m = (IPD_METRES * focal_px) / ipd_px
+            dist_m = (self.ipd_m * focal_px) / ipd_px
         else:
             face_px = max(wsz * sx * FALLBACK_FACE_FILL, 1.0)
             dist_m  = (FALLBACK_FACE_W_M * focal_px) / face_px

@@ -36,26 +36,57 @@ class SingleFaceTracker:
     MAX_DISTANCE    = 200    # pixel radius for "same face"
     DIST_WINDOW     = 7      # frames in the distance median window
     LOCK_CONFIRM    = 2      # consecutive confirming frames required to lock on
+    DIST_EMA_ALPHA  = 0.35   # EMA on top of median for final smoothness
+    IPD_OUTLIER_DEV = 0.30   # reject distance updates where IPD deviates
+                             # >30% from the running IPD median (catches
+                             # single-frame landmark mislocalisations)
 
     def __init__(self) -> None:
-        self.track:      Optional[dict] = None
-        self.age:        int            = 0
-        self.dist_q:     List[float]    = []
-        self.candidate:  Optional[dict] = None
-        self.cand_hits:  int            = 0
+        self.track:      Optional[dict]  = None
+        self.age:        int             = 0
+        self.dist_q:     List[float]     = []
+        self.ipd_q:      List[float]     = []      # running window of raw IPD_px
+        self.ema_dist:   Optional[float] = None    # EMA state on top of median
+        self.candidate:  Optional[dict]  = None
+        self.cand_hits:  int             = 0
 
     # ------------------------------------------------------------------ helpers
 
+    def _ipd_is_outlier(self, ipd_px: float) -> bool:
+        """True if ipd_px deviates >IPD_OUTLIER_DEV from running median."""
+        if ipd_px <= 0 or len(self.ipd_q) < 3:
+            return False
+        med = sorted(self.ipd_q)[len(self.ipd_q) // 2]
+        if med <= 0:
+            return False
+        return abs(ipd_px - med) / med > self.IPD_OUTLIER_DEV
+
     def _smooth_dist(self, new_dist: float) -> float:
-        """Median filter across `DIST_WINDOW` recent readings."""
+        """Median filter + EMA on top — median kills spikes, EMA kills jitter."""
         self.dist_q.append(new_dist)
         if len(self.dist_q) > self.DIST_WINDOW:
             self.dist_q.pop(0)
-        return round(sorted(self.dist_q)[len(self.dist_q) // 2], 2)
+        median = sorted(self.dist_q)[len(self.dist_q) // 2]
+
+        if self.ema_dist is None:
+            self.ema_dist = median
+        else:
+            a = self.DIST_EMA_ALPHA
+            self.ema_dist = a * median + (1 - a) * self.ema_dist
+        return round(self.ema_dist, 2)
+
+    def _record_ipd(self, ipd_px: float) -> None:
+        if ipd_px <= 0:
+            return
+        self.ipd_q.append(ipd_px)
+        if len(self.ipd_q) > self.DIST_WINDOW:
+            self.ipd_q.pop(0)
 
     def _reset_all(self) -> None:
         self.track       = None
         self.dist_q      = []
+        self.ipd_q       = []
+        self.ema_dist    = None
         self.candidate   = None
         self.cand_hits   = 0
         self.age         = 0
@@ -196,7 +227,7 @@ class SingleFaceTracker:
         return max_shift <= LMK_TEMPORAL_MAX * box_size
 
     def _merge_match(self, new: dict, centroid: tuple) -> None:
-        """EMA-blend box, median-filter distance, adopt new landmarks."""
+        """EMA-blend box, filter distance through IPD-outlier + median + EMA."""
         a = TRACK_BOX_ALPHA
         ox1, oy1, ox2, oy2 = self.track['box']
         nx1, ny1, nx2, ny2 = new['box']
@@ -204,10 +235,22 @@ class SingleFaceTracker:
             int((1 - a) * ox1 + a * nx1), int((1 - a) * oy1 + a * ny1),
             int((1 - a) * ox2 + a * nx2), int((1 - a) * oy2 + a * ny2),
         )
+
+        # Decide whether to let this frame's distance update through.
+        # If the measured IPD is wildly different from recent IPDs, the
+        # landmarks are probably wrong — keep the previous smoothed value
+        # rather than polluting the median buffer with noise.
+        new_ipd = float(new.get('ipd_px', 0.0) or 0.0)
+        if self._ipd_is_outlier(new_ipd):
+            smoothed_dist = self.track['dist']
+        else:
+            self._record_ipd(new_ipd)
+            smoothed_dist = self._smooth_dist(new['dist'])
+
         self.track = {
             **new,
             'box':  smooth_box,
-            'dist': self._smooth_dist(new['dist']),
+            'dist': smoothed_dist,
             'cx':   centroid[0],
             'cy':   centroid[1],
         }

@@ -93,7 +93,8 @@ def run(camera_idx: int   = 0,
         det_ckpt:   str   = 'checkpoints/face_detector.pth',
         lmk_ckpt:   str   = 'checkpoints/landmark_net.pth',
         det_thresh: float = DET_THRESH,
-        focal_px:   float = 0.0) -> None:
+        focal_px:   float = 0.0,
+        ipd_m:      float = IPD_METRES) -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device        : {device}")
@@ -110,7 +111,11 @@ def run(camera_idx: int   = 0,
         detector, device, det_thresh,
         focal_px     = focal_px if focal_px > 0 else None,
         landmark_net = landmark_net,
+        ipd_m        = ipd_m,
     )
+    if abs(ipd_m - IPD_METRES) > 1e-6:
+        print(f"IPD override  : {ipd_m*100:.1f} cm "
+              f"(vs {IPD_METRES*100:.1f} cm population average)")
     worker.start()
 
     tracker = SingleFaceTracker()
@@ -197,7 +202,9 @@ def _calibrate(worker: DetectionWorker, tracker: SingleFaceTracker):
     new_focal  = 0.0
     method     = ''
     if ipd_px and ipd_px > 4:
-        new_focal = (ipd_px * known_dist) / IPD_METRES
+        # Use the worker's per-user ipd_m (set via --ipd), not the population
+        # average — otherwise calibration at 1m gives a slightly wrong focal.
+        new_focal = (ipd_px * known_dist) / worker.ipd_m
         method    = 'IPD'
     elif wsz_orig > 0:
         new_focal = (wsz_orig * FALLBACK_FACE_FILL * known_dist) / FALLBACK_FACE_W_M
@@ -226,13 +233,19 @@ def main() -> None:
                    help='Detector sigmoid threshold (default 0.40)')
     p.add_argument('--focal',      type=float, default=0.0,
                    help='Camera focal (px). 0 = auto-estimate. Press C at 1.0m to calibrate.')
+    p.add_argument('--ipd',        type=float, default=IPD_METRES,
+                   help='Your inter-pupillary distance in metres (default 0.063 = '
+                        'adult population average). Measure yours with a ruler in a '
+                        'mirror and pass it here to remove up to ±5%% of distance bias. '
+                        'Typical range 0.055–0.070.')
     args = p.parse_args()
 
     run(camera_idx = args.camera,
         det_ckpt   = args.det_ckpt,
         lmk_ckpt   = args.lmk_ckpt,
         det_thresh = args.det_thresh,
-        focal_px   = args.focal)
+        focal_px   = args.focal,
+        ipd_m      = args.ipd)
 
 
 if __name__ == '__main__':
