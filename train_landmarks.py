@@ -25,6 +25,7 @@ USAGE
     python train_landmarks.py
 """
 
+import argparse
 import random
 import time
 from pathlib import Path
@@ -41,8 +42,9 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
 from facetrack.landmarks import (
-    LandmarkCNN, LANDMARK_TRAIN_TF, LANDMARK_INFER_TF,
+    LANDMARK_TRAIN_TF, LANDMARK_INFER_TF,
     flip_landmarks_horizontal,
+    build_landmark_net,
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -56,8 +58,14 @@ CELEBA_DIR       = Path('datasets/tmp_celeba')
 #   list_landmarks_align_celeba.csv   (or .txt in some dumps)
 CELEBA_IMG_ROOT  = CELEBA_DIR / 'img_align_celeba' / 'img_align_celeba'
 
-CKPT_PATH        = Path('checkpoints/landmark_net.pth')
 CKPT_DIR         = Path('checkpoints')
+# The default checkpoint path depends on architecture — direct regression
+# continues to write landmark_net.pth; heatmap writes landmark_net_heatmap.pth
+# so both variants can coexist in the checkpoints dir.
+CKPT_DEFAULTS    = {
+    'direct':  CKPT_DIR / 'landmark_net.pth',
+    'heatmap': CKPT_DIR / 'landmark_net_heatmap.pth',
+}
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 EPOCHS       = 30
@@ -284,10 +292,14 @@ class LandmarkDataset(Dataset):
         return self.transform(pil), torch.tensor(normed, dtype=torch.float32)
 
 
-def train():
+def train(arch: str = 'direct', ckpt_path: Path = None):
     CKPT_DIR.mkdir(exist_ok=True)
+    if ckpt_path is None:
+        ckpt_path = CKPT_DEFAULTS[arch]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device}\n')
+    print(f'Device: {device}')
+    print(f'Arch:   {arch}')
+    print(f'Ckpt:   {ckpt_path}\n')
 
     print('Loading datasets ...')
     samples = []
@@ -320,7 +332,9 @@ def train():
 
     print(f'Train: {len(tr_ds):,}  |  Val: {len(va_ds):,}\n')
 
-    model     = LandmarkCNN().to(device)
+    model     = build_landmark_net(arch).to(device)
+    n_params  = sum(p.numel() for p in model.parameters())
+    print(f'Model: {type(model).__name__} ({n_params:,} params)')
     criterion = nn.SmoothL1Loss()         # robust to landmark-annotation noise
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler    = GradScaler('cuda')
@@ -370,15 +384,26 @@ def train():
 
         if va_err_norm < best_err:
             best_err = va_err_norm
-            torch.save({'model': model.state_dict(),
+            torch.save({'model':   model.state_dict(),
+                        'arch':    arch,
                         'val_err': best_err,
-                        'epoch': epoch}, CKPT_PATH)
+                        'epoch':   epoch}, ckpt_path)
             print(f"      ↑ saved  (normalised landmark error = {best_err:.4f})")
 
     print(f'\nTraining complete.  Best val error = {best_err:.4f} (normalised)')
     print(f'  → ≈ {best_err * 64:.2f} px error on a 64×64 crop')
-    print(f'Checkpoint: {CKPT_PATH}')
+    print(f'Checkpoint: {ckpt_path}')
 
 
 if __name__ == '__main__':
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--arch', choices=('direct', 'heatmap'),
+                        default='direct',
+                        help='Landmark head architecture. direct=coord '
+                             'regression (shipped v2). heatmap=DSNT-style '
+                             'soft-argmax (experimental, sub-pixel).')
+    parser.add_argument('--ckpt', type=str, default=None,
+                        help='Override checkpoint output path.')
+    args = parser.parse_args()
+    ckpt = Path(args.ckpt) if args.ckpt else None
+    train(arch=args.arch, ckpt_path=ckpt)

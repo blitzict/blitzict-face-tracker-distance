@@ -30,7 +30,7 @@ import torch
 
 from facetrack              import SingleFaceTracker, DetectionWorker
 from facetrack.detector     import FaceDetectorCNN
-from facetrack.landmarks    import LandmarkCNN
+from facetrack.landmarks    import build_landmark_net
 from facetrack.config       import (
     DET_THRESH, IPD_METRES, FOCAL_RATIO,
     FALLBACK_FACE_W_M, FALLBACK_FACE_FILL,
@@ -56,12 +56,16 @@ def load_landmark_net(path: str, device: torch.device):
     if not Path(path).exists():
         return None
     try:
-        ckpt  = torch.load(path, map_location=device, weights_only=False)
-        model = LandmarkCNN().to(device)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        # Checkpoints saved by train_landmarks.py now tag the architecture.
+        # Older (pre-heatmap) checkpoints lack the key → default to 'direct'.
+        arch = ckpt.get('arch', 'direct')
+        model = build_landmark_net(arch).to(device)
         model.load_state_dict(ckpt['model'])
         model.eval()
         err = ckpt.get('val_err', float('nan'))
-        print(f"Landmark net  : {path}  (val err = {err:.4f} ≈ {err*64:.1f}px on 64×64)")
+        print(f"Landmark net  : {path}  arch={arch}  "
+              f"(val err = {err:.4f} ≈ {err*64:.1f}px on 64×64)")
         return model
     except Exception as e:
         print(f"Landmark net  : failed to load ({e})")

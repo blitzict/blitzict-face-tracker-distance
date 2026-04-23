@@ -81,6 +81,91 @@ class LandmarkCNN(nn.Module):
         return self.regressor(self.features(x))   # [B, NUM_OUTPUTS]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Heatmap-regression variant (DSNT-style soft-argmax)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Direct-coord regression (LandmarkCNN above) floors out around 0.2-0.3 px of
+# landmark error at 64×64 — the last FC layer has to compress all spatial
+# information into 10 scalars and ~0.005 normalised error is about as tight
+# as that bottleneck allows. Heatmap regression moves the spatial inference
+# back into the feature map: the head outputs one heatmap per landmark, and
+# a soft-argmax decodes sub-pixel coordinates by taking the expected value
+# under the spatial softmax. The argmax is fully differentiable so the model
+# trains with the same coord-space loss as the direct-regression variant.
+#
+# Public API is the same as LandmarkCNN — `forward(x) -> [B, 10]` normalised
+# coords — so this class is a drop-in replacement for pipeline.py.
+
+HEATMAP_SIZE = 32      # decoder output H×W; soft-argmax is sub-pixel so this
+                       # does not bound accuracy the way the input patch does
+
+
+class LandmarkHeatmapCNN(nn.Module):
+    """
+    64×64 face crop → 5 heatmaps @ HEATMAP_SIZE × HEATMAP_SIZE → soft-argmax →
+    10 normalised coords. Same [B, 10] output shape as LandmarkCNN so the
+    inference pipeline needs no changes.
+    """
+
+    def __init__(self, heatmap_size: int = HEATMAP_SIZE):
+        super().__init__()
+        self.heatmap_size = heatmap_size
+
+        # Encoder — keeps spatial resolution at 8×8 after block 3 (no final
+        # adaptive-pool, unlike the direct-regression LandmarkCNN).
+        self.features = nn.Sequential(
+            # Block 1  64 → 32
+            nn.Conv2d(3, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.SiLU(),
+            nn.Conv2d(32, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.SiLU(),
+            nn.MaxPool2d(2),
+            # Block 2  32 → 16
+            nn.Conv2d(32, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.SiLU(),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.SiLU(),
+            nn.MaxPool2d(2),
+            # Block 3  16 → 8  (no pool after — decoder upsamples from here)
+            nn.Conv2d(64, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128), nn.SiLU(),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128), nn.SiLU(),
+        )
+
+        # Decoder: 8 → 16 → 32, final 1×1 conv to NUM_LANDMARKS channels.
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.SiLU(),
+            nn.Conv2d(32, NUM_LANDMARKS, kernel_size=1),     # 5 heatmaps
+        )
+
+    def forward_heatmap(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw logit heatmaps — [B, 5, H, W]. Exposed for debug/visualisation."""
+        return self.decoder(self.features(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Soft-argmax → normalised coords [B, 10] in (x0,y0,x1,y1,...) order."""
+        heat = self.forward_heatmap(x)                       # [B, 5, H, W]
+        B, K, H, W = heat.shape
+        prob = torch.softmax(heat.view(B, K, -1), dim=-1).view(B, K, H, W)
+
+        # Grids normalised to [0, 1] over the heatmap, matching the label space.
+        ys = torch.linspace(0.0, 1.0, H, device=heat.device).view(1, 1, H, 1)
+        xs = torch.linspace(0.0, 1.0, W, device=heat.device).view(1, 1, 1, W)
+        x_coord = (prob * xs).sum(dim=(2, 3))                # [B, 5]
+        y_coord = (prob * ys).sum(dim=(2, 3))
+        # Interleave into (x0, y0, x1, y1, ...) to match LandmarkCNN's output.
+        coords  = torch.stack([x_coord, y_coord], dim=-1)    # [B, 5, 2]
+        return coords.view(B, NUM_OUTPUTS)
+
+
+def build_landmark_net(arch: str = 'direct'):
+    """Factory: 'direct' (LandmarkCNN) or 'heatmap' (LandmarkHeatmapCNN)."""
+    if arch == 'heatmap':
+        return LandmarkHeatmapCNN()
+    if arch == 'direct':
+        return LandmarkCNN()
+    raise ValueError(f"Unknown landmark arch: {arch!r}")
+
+
 # ── Image transforms ──────────────────────────────────────────────────────────
 #
 # Photometric transforms only — geometric transforms (flip / rotation / affine)
