@@ -138,23 +138,87 @@ class LandmarkHeatmapCNN(nn.Module):
         )
 
     def forward_heatmap(self, x: torch.Tensor) -> torch.Tensor:
-        """Raw logit heatmaps — [B, 5, H, W]. Exposed for debug/visualisation."""
+        """Raw logit heatmaps — [B, 5, H, W]. Used by training for the DSNT
+        regulariser and by visualisation."""
         return self.decoder(self.features(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Soft-argmax → normalised coords [B, 10] in (x0,y0,x1,y1,...) order."""
-        heat = self.forward_heatmap(x)                       # [B, 5, H, W]
-        B, K, H, W = heat.shape
-        prob = torch.softmax(heat.view(B, K, -1), dim=-1).view(B, K, H, W)
+        return soft_argmax(self.forward_heatmap(x))
 
-        # Grids normalised to [0, 1] over the heatmap, matching the label space.
-        ys = torch.linspace(0.0, 1.0, H, device=heat.device).view(1, 1, H, 1)
-        xs = torch.linspace(0.0, 1.0, W, device=heat.device).view(1, 1, 1, W)
-        x_coord = (prob * xs).sum(dim=(2, 3))                # [B, 5]
-        y_coord = (prob * ys).sum(dim=(2, 3))
-        # Interleave into (x0, y0, x1, y1, ...) to match LandmarkCNN's output.
-        coords  = torch.stack([x_coord, y_coord], dim=-1)    # [B, 5, 2]
-        return coords.view(B, NUM_OUTPUTS)
+
+# ── Heatmap decode + DSNT regulariser helpers ────────────────────────────────
+
+def soft_argmax(heatmap_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Decode [B, K, H, W] logit heatmaps to [B, 2K] normalised (x, y) coords,
+    using the softmax-weighted expected value (differentiable sub-pixel argmax).
+    """
+    B, K, H, W = heatmap_logits.shape
+    prob = torch.softmax(heatmap_logits.view(B, K, -1), dim=-1).view(B, K, H, W)
+    ys = torch.linspace(0.0, 1.0, H, device=heatmap_logits.device).view(1, 1, H, 1)
+    xs = torch.linspace(0.0, 1.0, W, device=heatmap_logits.device).view(1, 1, 1, W)
+    x_coord = (prob * xs).sum(dim=(2, 3))                    # [B, K]
+    y_coord = (prob * ys).sum(dim=(2, 3))
+    coords  = torch.stack([x_coord, y_coord], dim=-1)        # [B, K, 2]
+    return coords.view(B, K * 2)
+
+
+def _gaussian_target(target_coords_norm: torch.Tensor,
+                     H: int, W: int, sigma_px: float) -> torch.Tensor:
+    """
+    Build a [B, K, H, W] Gaussian prior centred on each ground-truth landmark,
+    normalised to sum=1 per heatmap.
+        target_coords_norm : [B, K, 2] in [0, 1]
+        sigma_px           : Gaussian sigma in heatmap-pixel units
+    """
+    B, K, _ = target_coords_norm.shape
+    gx = target_coords_norm[..., 0] * (W - 1)                # [B, K]
+    gy = target_coords_norm[..., 1] * (H - 1)
+    ys = torch.arange(H, device=target_coords_norm.device,
+                      dtype=target_coords_norm.dtype).view(1, 1, H, 1)
+    xs = torch.arange(W, device=target_coords_norm.device,
+                      dtype=target_coords_norm.dtype).view(1, 1, 1, W)
+    g = torch.exp(-((xs - gx.view(B, K, 1, 1)) ** 2
+                    + (ys - gy.view(B, K, 1, 1)) ** 2)
+                  / (2.0 * sigma_px * sigma_px))
+    g = g / g.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    return g                                                  # [B, K, H, W]
+
+
+def dsnt_regulariser(heatmap_logits: torch.Tensor,
+                     target_coords_norm: torch.Tensor,
+                     sigma_px: float = 1.0) -> torch.Tensor:
+    """
+    Jensen-Shannon divergence between the softmax'd heatmap and a Gaussian
+    prior centred on the ground-truth coord. Pushes heatmaps to be peaky and
+    correctly located — without it, soft-argmax operates on a blurry blob and
+    loses the sub-pixel advantage of heatmap regression over direct coords.
+
+    Reference: Nibali et al., "Numerical Coordinate Regression with
+    Convolutional Neural Networks" (arXiv:1801.07372).
+
+    Args
+        heatmap_logits     : [B, K, H, W] — model.forward_heatmap output
+        target_coords_norm : [B, K, 2]    — ground-truth coords in [0, 1]
+        sigma_px           : target Gaussian sigma in heatmap pixels
+
+    Returns
+        scalar loss (batch + landmark mean).
+    """
+    B, K, H, W = heatmap_logits.shape
+    p = torch.softmax(heatmap_logits.view(B, K, -1), dim=-1).view(B, K, H, W)
+    q = _gaussian_target(target_coords_norm, H, W, sigma_px)
+    m = 0.5 * (p + q)
+
+    eps  = 1e-8
+    logp = p.clamp(min=eps).log()
+    logq = q.clamp(min=eps).log()
+    logm = m.clamp(min=eps).log()
+
+    kl_pm = (p * (logp - logm)).sum(dim=(-2, -1))            # [B, K]
+    kl_qm = (q * (logq - logm)).sum(dim=(-2, -1))
+    return 0.5 * (kl_pm + kl_qm).mean()
 
 
 def build_landmark_net(arch: str = 'direct'):

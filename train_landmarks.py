@@ -45,7 +45,17 @@ from facetrack.landmarks import (
     LANDMARK_TRAIN_TF, LANDMARK_INFER_TF,
     flip_landmarks_horizontal,
     build_landmark_net,
+    soft_argmax, dsnt_regulariser,
 )
+
+# DSNT regulariser weight + Gaussian sigma (heatmap pixels). Used only for
+# arch='heatmap'. Without this the heatmap stays blurry and the sub-pixel
+# advantage over direct regression disappears — the first heatmap run tied
+# the direct net's val error at 0.0038 for exactly this reason. λ=0.1 is
+# large enough to force peaky heatmaps early and small enough to let the
+# coord loss drive precise localisation once peaks are established.
+DSNT_WEIGHT = 0.1
+DSNT_SIGMA  = 1.0
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 WIDER_DIR        = Path('datasets/tmp_wider')
@@ -342,28 +352,47 @@ def train(arch: str = 'direct', ckpt_path: Path = None):
                            total_steps=EPOCHS * len(tr_loader),
                            pct_start=0.1, anneal_strategy='cos')
 
+    use_dsnt = (arch == 'heatmap')
     best_err = float('inf')
-    print(f"{'Epoch':>5} | {'TrLoss':>8} {'TrErr':>6} | {'VaLoss':>8} {'VaErr':>6} | {'Time':>5}")
-    print('─' * 58)
+    hdr = f"{'Epoch':>5} | {'TrLoss':>8} {'TrErr':>6}"
+    if use_dsnt:
+        hdr += f" {'TrJSD':>7}"
+    hdr += f" | {'VaLoss':>8} {'VaErr':>6} | {'Time':>5}"
+    print(hdr)
+    print('─' * len(hdr))
 
     for epoch in range(EPOCHS):
         t0 = time.time()
 
         model.train()
-        tr_loss = tr_err = tr_n = 0
+        tr_loss = tr_err = tr_jsd = tr_n = 0
         for imgs, targets in tr_loader:
             imgs    = imgs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with autocast('cuda'):
-                preds = model(imgs)
-                loss  = criterion(preds, targets)
+                if use_dsnt:
+                    heat  = model.forward_heatmap(imgs)              # [B,5,H,W]
+                    preds = soft_argmax(heat)                         # [B,10]
+                    # Reshape normalised targets [B,10] → [B,5,2] for the
+                    # Gaussian-target builder.
+                    tgt_pairs = targets.view(-1, 5, 2)
+                    l_coord   = criterion(preds, targets)
+                    l_jsd     = dsnt_regulariser(heat, tgt_pairs,
+                                                 sigma_px=DSNT_SIGMA)
+                    loss = l_coord + DSNT_WEIGHT * l_jsd
+                else:
+                    preds = model(imgs)
+                    loss  = criterion(preds, targets)
+                    l_jsd = None
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer); scaler.update(); scheduler.step()
             tr_loss += loss.item() * imgs.size(0)
             tr_err  += (preds.detach() - targets).abs().mean(dim=1).sum().item()
+            if l_jsd is not None:
+                tr_jsd += l_jsd.item() * imgs.size(0)
             tr_n    += imgs.size(0)
 
         model.eval()
@@ -372,15 +401,19 @@ def train(arch: str = 'direct', ckpt_path: Path = None):
             for imgs, targets in va_loader:
                 imgs    = imgs.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                preds   = model(imgs)
+                preds   = model(imgs)     # for both arches, this is coord-space
                 loss    = criterion(preds, targets)
                 va_loss += loss.item() * imgs.size(0)
                 va_err  += (preds - targets).abs().mean(dim=1).sum().item()
                 va_n    += imgs.size(0)
 
         va_err_norm = va_err / va_n
-        print(f"{epoch+1:>5} | {tr_loss/tr_n:>8.5f} {tr_err/tr_n:>6.4f} "
-              f"| {va_loss/va_n:>8.5f} {va_err_norm:>6.4f} | {time.time()-t0:>4.1f}s")
+        row = (f"{epoch+1:>5} | {tr_loss/tr_n:>8.5f} {tr_err/tr_n:>6.4f}")
+        if use_dsnt:
+            row += f" {tr_jsd/tr_n:>7.4f}"
+        row += (f" | {va_loss/va_n:>8.5f} {va_err_norm:>6.4f} "
+                f"| {time.time()-t0:>4.1f}s")
+        print(row)
 
         if va_err_norm < best_err:
             best_err = va_err_norm
