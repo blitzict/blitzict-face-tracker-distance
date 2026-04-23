@@ -36,6 +36,8 @@ from facetrack.config import (
     FALLBACK_FACE_W_M, FALLBACK_FACE_FILL,
     SYMMETRY_THRESH, SKIN_RATIO_THRESH,
     EYE_TO_MOUTH_M, MOUTH_WIDTH_M, DIST_CUE_WEIGHTS,
+    LMK_EMA_ALPHA, LMK_EMA_RESET_PX,
+    UNDISTORT_ENABLE, UNDISTORT_K1, UNDISTORT_K2,
 )
 from facetrack.detector  import FaceDetectorCNN, DETECTOR_PATCH_SIZE
 from facetrack.landmarks import LandmarkCNN, LANDMARK_INFER_TF, flip_landmarks_horizontal
@@ -179,6 +181,73 @@ def scores_to_boxes(meta: list, scores: list, H: int, W: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Pure helper: (landmarks, focal, ipd) → distance + yaw + head box
+# Shared by the raw-frame path and the EMA-smoothed recompute path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def derive_from_landmarks(lmks_abs, W_orig: int, H_orig: int,
+                          focal_px: float, ipd_m: float):
+    """
+    Given absolute-coord landmarks (10 floats in lex,ley,rex,rey,nox,noy,lmx,lmy,
+    rmx,rmy order), derive everything the display pipeline needs:
+        ipd_px (yaw-corrected), yaw_deg, dist_m (multi-cue), head-box, eyes.
+
+    Returns None if IPD is too small to trust. Otherwise a dict ready to merge
+    into the detection.
+    """
+    lx, ly, rx, ry, nx_, ny_, lmx, lmy, rmx, rmy = lmks_abs
+    ipd_raw_px = float(np.hypot(lx - rx, ly - ry))
+    if ipd_raw_px <= 4.0:
+        return None
+
+    eye_mid_x   = (lx + rx) * 0.5
+    eye_mid_y   = (ly + ry) * 0.5
+    mouth_mid_y = (lmy + rmy) * 0.5
+
+    # Yaw from nose offset vs. eye midline
+    nose_off = nx_ - eye_mid_x
+    tan_yaw  = (nose_off / max(ipd_raw_px, 1.0)) / (NOSE_DEPTH_M / IPD_METRES)
+    tan_yaw  = max(min(tan_yaw, 2.75), -2.75)         # clamp ≤ ±70°
+    cos_yaw  = 1.0 / (1.0 + tan_yaw * tan_yaw) ** 0.5
+    yaw_deg  = float(np.degrees(np.arctan(tan_yaw)))
+
+    ipd_px   = ipd_raw_px / max(cos_yaw, 0.35)
+
+    # Three anthropometric cues → weighted mean
+    e2m_px_val = float(max(mouth_mid_y - eye_mid_y, 1.0))   # vertical, yaw-free
+    mw_px_raw  = float(np.hypot(lmx - rmx, lmy - rmy))
+    mw_px_val  = mw_px_raw / max(cos_yaw, 0.35)
+
+    d_ipd = (ipd_m          * focal_px) / ipd_px
+    d_e2m = (EYE_TO_MOUTH_M * focal_px) / e2m_px_val
+    d_mw  = (MOUTH_WIDTH_M  * focal_px) / mw_px_val
+
+    w      = DIST_CUE_WEIGHTS
+    dist_m = w['ipd']*d_ipd + w['eye_to_mouth']*d_e2m + w['mouth_width']*d_mw
+    dist_m = round(max(0.3, min(dist_m, 10.0)), 2)
+
+    # Tight head box derived from landmarks
+    eye_to_mouth = max(mouth_mid_y - eye_mid_y, 10.0)
+    head_w_px    = max(2.30 * ipd_px, 40.0)
+    face_top     = eye_mid_y   - 1.10 * eye_to_mouth
+    face_bot     = mouth_mid_y + 0.70 * eye_to_mouth
+
+    tx1 = max(int(eye_mid_x - head_w_px * 0.5), 0)
+    tx2 = min(int(eye_mid_x + head_w_px * 0.5), W_orig - 1)
+    ty1 = max(int(face_top), 0)
+    ty2 = min(int(face_bot), H_orig - 1)
+
+    return {
+        'ipd_px':  ipd_px,
+        'yaw_deg': yaw_deg,
+        'cos_yaw': cos_yaw,
+        'dist_m':  dist_m,
+        'head_box': (tx1, ty1, tx2, ty2) if (tx2 > tx1 and ty2 > ty1) else None,
+        'eyes':    (int(lx), int(ly), int(rx), int(ry)),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Background detection worker
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -213,6 +282,18 @@ class DetectionWorker:
         self._lock    = threading.Lock()
         self._results: List[dict] = []
         self._running = False
+
+        # Per-landmark EMA state. Only updated while a track is locked (single
+        # detection per frame). Reset whenever searching, to avoid blending
+        # with stale coords from a previous lock.
+        self._lmk_ema_prev: Optional[tuple] = None
+
+        # Radial-undistort remap tables, built lazily on first frame once we
+        # know the resolution. Cached for the lifetime of the worker — the
+        # camera resolution doesn't change between frames.
+        self._undist_map1 = None
+        self._undist_map2 = None
+        self._undist_res  = None     # (W, H) the maps were built for
 
     # ------------------------------------------------------------------ thread
 
@@ -252,9 +333,40 @@ class DetectionWorker:
 
     # ------------------------------------------------------------- processing
 
+    def _ensure_undistort_maps(self, W: int, H: int) -> None:
+        """Build (and cache) the rectify maps for this frame resolution."""
+        if not UNDISTORT_ENABLE:
+            return
+        if self._undist_res == (W, H) and self._undist_map1 is not None:
+            return
+        # Without a per-camera calibration, guess a plausible pinhole: focal
+        # from FOCAL_RATIO (matches the distance formula's default), principal
+        # point at image centre. k1/k2 are small fixed values; p1/p2/k3 = 0.
+        focal_guess = W * FOCAL_RATIO
+        K = np.array([[focal_guess, 0.0,         W / 2.0],
+                      [0.0,         focal_guess, H / 2.0],
+                      [0.0,         0.0,         1.0    ]], dtype=np.float32)
+        dist = np.array([UNDISTORT_K1, UNDISTORT_K2, 0.0, 0.0, 0.0],
+                        dtype=np.float32)
+        # alpha=0 crops out black borders from the undistorted image.
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (W, H), alpha=0.0)
+        self._undist_map1, self._undist_map2 = cv2.initUndistortRectifyMap(
+            K, dist, None, new_K, (W, H), cv2.CV_16SC2)
+        self._undist_res = (W, H)
+
     @torch.no_grad()
     def _process(self, frame_bgr: np.ndarray, track_box=None) -> List[dict]:
         H_orig, W_orig = frame_bgr.shape[:2]
+
+        # ── Stage 0: radial undistort (cached maps) ─────────────────────────
+        # Remaps the frame into a rectified coord system so a face at the image
+        # edge isn't reported as shorter-IPD / farther than it really is.
+        if UNDISTORT_ENABLE:
+            self._ensure_undistort_maps(W_orig, H_orig)
+            if self._undist_map1 is not None:
+                frame_bgr = cv2.remap(frame_bgr, self._undist_map1,
+                                      self._undist_map2,
+                                      interpolation=cv2.INTER_LINEAR)
 
         # ── Stage 1: detect on a small downscale ─────────────────────────────
         det_frame = cv2.resize(frame_bgr, (DET_W, DET_H))
@@ -325,7 +437,53 @@ class DetectionWorker:
             if d is not None:
                 detections.append(d)
 
+        # ── Per-landmark EMA smoothing (locked, single-detection path) ───────
+        # Smoothing upstream of distance — the 5 landmarks are the noisy
+        # signal; smoothing them feeds cleaner cues to the distance formula.
+        # Gated on `track_box is not None and len==1` so we never blend the
+        # wrong face's landmarks, and reset whenever we fall back to search.
+        if track_box is not None and len(detections) == 1 \
+                and detections[0].get('lmks_abs') is not None:
+            self._apply_landmark_ema(detections[0], W_orig, H_orig, focal_px)
+        else:
+            self._lmk_ema_prev = None
+
         return detections
+
+    def _apply_landmark_ema(self, det: dict, W_orig: int, H_orig: int,
+                             focal_px: float) -> None:
+        """In-place: EMA-blend `det['lmks_abs']` with prev; recompute dist/yaw/
+        head-box from the smoothed landmarks."""
+        raw = det['lmks_abs']
+        prev = self._lmk_ema_prev
+
+        if prev is not None:
+            # If any landmark jumped wildly (re-lock, occlusion), seed fresh
+            # from this frame rather than dragging EMA through a discontinuity.
+            max_jump = max(abs(r - p) for r, p in zip(raw, prev))
+            if max_jump > LMK_EMA_RESET_PX:
+                prev = None
+
+        if prev is None:
+            smoothed = tuple(float(v) for v in raw)
+        else:
+            a = LMK_EMA_ALPHA
+            smoothed = tuple(a * r + (1.0 - a) * p for r, p in zip(raw, prev))
+
+        self._lmk_ema_prev = smoothed
+
+        derived = derive_from_landmarks(smoothed, W_orig, H_orig,
+                                        focal_px, self.ipd_m)
+        if derived is None:
+            return
+
+        det['lmks_abs'] = smoothed
+        det['dist']     = derived['dist_m']
+        det['ipd_px']   = derived['ipd_px']
+        det['yaw']      = derived['yaw_deg']
+        det['eyes']     = derived['eyes']
+        if derived['head_box'] is not None:
+            det['box'] = derived['head_box']
 
     # ................................................. single-candidate path
 
@@ -342,10 +500,11 @@ class DetectionWorker:
         if lm_crop.size == 0:
             return None
 
-        ipd_px = None
+        ipd_px   = None
         eyes_abs = None
         lmks_abs = None
         yaw_deg  = 0.0
+        dist_m   = None
 
         if self.landmark_net is not None:
             pil    = Image.fromarray(lm_crop[:, :, ::-1])        # BGR → RGB
@@ -382,65 +541,27 @@ class DetectionWorker:
             nx_abs  = cx1 + nx_ * cw;  ny_abs  = cy1 + ny_ * ch
             lmx_abs = cx1 + lmx * cw;  lmy_abs = cy1 + lmy * ch
             rmx_abs = cx1 + rmx * cw;  rmy_abs = cy1 + rmy * ch
-            ipd_raw_px = float(np.hypot(lx_abs - rx_abs, ly_abs - ry_abs))
-            eyes_abs   = (int(lx_abs), int(ly_abs), int(rx_abs), int(ry_abs))
-            lmks_abs   = (lx_abs, ly_abs, rx_abs, ry_abs,
-                          nx_abs, ny_abs,
-                          lmx_abs, lmy_abs, rmx_abs, rmy_abs)
+            lmks_abs = (lx_abs, ly_abs, rx_abs, ry_abs,
+                        nx_abs, ny_abs,
+                        lmx_abs, lmy_abs, rmx_abs, rmy_abs)
 
-            # ── Yaw correction ───────────────────────────────────────────────
-            eye_mid_x   = (lx_abs + rx_abs) * 0.5
-            nose_off    = nx_abs - eye_mid_x
-            tan_yaw     = (nose_off / max(ipd_raw_px, 1.0)) / (NOSE_DEPTH_M / IPD_METRES)
-            tan_yaw     = max(min(tan_yaw, 2.75), -2.75)       # clamp ≤ ±70°
-            cos_yaw     = 1.0 / (1.0 + tan_yaw * tan_yaw) ** 0.5
-            yaw_deg     = float(np.degrees(np.arctan(tan_yaw)))
-            ipd_px      = ipd_raw_px / max(cos_yaw, 0.35)
+            derived = derive_from_landmarks(lmks_abs, W_orig, H_orig,
+                                            focal_px, self.ipd_m)
+            if derived is not None:
+                ipd_px   = derived['ipd_px']
+                yaw_deg  = derived['yaw_deg']
+                dist_m   = derived['dist_m']
+                eyes_abs = derived['eyes']
+                if derived['head_box'] is not None:
+                    x1, y1, x2, y2 = derived['head_box']
+            else:
+                lmks_abs = None   # IPD too small; fall through to face-width fallback
 
-            # ── Tight head box derived from landmarks ────────────────────────
-            eye_mid_y    = (ly_abs + ry_abs) * 0.5
-            mouth_mid_y  = (lmy_abs + rmy_abs) * 0.5
-            eye_to_mouth = max(mouth_mid_y - eye_mid_y, 10.0)
-            head_w_px    = max(2.30 * ipd_px, 40.0)
-            face_top     = eye_mid_y  - 1.10 * eye_to_mouth
-            face_bot     = mouth_mid_y + 0.70 * eye_to_mouth
-            face_cx      = eye_mid_x
-
-            tx1 = max(int(face_cx - head_w_px * 0.5), 0)
-            tx2 = min(int(face_cx + head_w_px * 0.5), W_orig - 1)
-            ty1 = max(int(face_top), 0)
-            ty2 = min(int(face_bot), H_orig - 1)
-            if tx2 > tx1 and ty2 > ty1:
-                x1, y1, x2, y2 = tx1, ty1, tx2, ty2
-
-        # ── Distance from multi-cue anthropometry (or face-width fallback) ──
-        # Three landmark-derived cues, weighted by anatomical stability:
-        #   • IPD                — yaw-corrected, dominant signal
-        #   • eye-to-mouth       — vertical, not affected by yaw
-        #   • mouth-width        — yaw-corrected
-        # Averaging independent noisy measurements reduces jitter by √N.
-        dist_m = None
-        if lmks_abs is not None and ipd_px and ipd_px > 4:
-            # eye-to-mouth distance in pixels (vertical, so no yaw correction)
-            e2m_px_val = float(max(mouth_mid_y - eye_mid_y, 1.0))
-            # mouth width in pixels (horizontal, apply yaw correction)
-            mw_px_raw  = float(np.hypot(lmx_abs - rmx_abs, lmy_abs - rmy_abs))
-            mw_px_val  = mw_px_raw / max(cos_yaw, 0.35)
-
-            d_ipd = (self.ipd_m      * focal_px) / ipd_px
-            d_e2m = (EYE_TO_MOUTH_M  * focal_px) / e2m_px_val
-            d_mw  = (MOUTH_WIDTH_M   * focal_px) / mw_px_val
-
-            w = DIST_CUE_WEIGHTS
-            dist_m = (w['ipd']          * d_ipd +
-                      w['eye_to_mouth'] * d_e2m +
-                      w['mouth_width']  * d_mw)
-
+        # ── Distance — landmark path done above; fallback for missing landmarks
         if dist_m is None:
-            # Landmarks failed — fall back to detection-box face width
             face_px = max(wsz * sx * FALLBACK_FACE_FILL, 1.0)
             dist_m  = (FALLBACK_FACE_W_M * focal_px) / face_px
-        dist_m = round(max(0.3, min(dist_m, 10.0)), 2)
+            dist_m  = round(max(0.3, min(dist_m, 10.0)), 2)
 
         return {
             'box':      (x1, y1, x2, y2),

@@ -29,6 +29,18 @@ FOCAL_RATIO        = 0.72             # ≈ 75° FOV — typical phone camera
 FALLBACK_FACE_W_M  = 0.145            # used if landmark model is missing
 FALLBACK_FACE_FILL = 0.65             # face fraction of detection window
 
+# ── Radial distortion correction ─────────────────────────────────────────────
+# Wide-FOV webcams (the ~75° class this project targets) have mild barrel
+# distortion: a face near the image corner reads with a compressed IPD and the
+# distance formula over-estimates. We undistort the frame with a generic k1/k2
+# pair before any detection so every downstream pixel is in rectified space.
+# The maps are built once (cv2.initUndistortRectifyMap) and re-used per frame.
+# k1 negative = barrel correction. Safe mild defaults — set UNDISTORT_ENABLE
+# False to skip (e.g., when running on a camera you have proper intrinsics for).
+UNDISTORT_ENABLE = True
+UNDISTORT_K1     = -0.12              # barrel correction (dominant term)
+UNDISTORT_K2     = 0.03               # small 2nd-order correction
+
 # Multi-cue anthropometric constants. Each cue gives an independent distance
 # estimate; we weighted-average them to reduce landmark-noise-driven jitter.
 # Weights are ~1/σ² of the anatomical variability, normalised: IPD is the
@@ -44,6 +56,14 @@ DIST_CUE_WEIGHTS = {                  # must sum to 1
 # ── Tracker smoothing ─────────────────────────────────────────────────────────
 TRACK_BOX_ALPHA  = 0.45               # box EMA — higher = faster reaction
 TRACK_DIST_ALPHA = 0.30               # kept for backwards compat; main dist uses median
+
+# Per-landmark EMA applied *upstream* of distance computation, while a face is
+# locked. Smoothing the raw (x,y) landmark points before computing IPD / eye-to-
+# mouth / mouth-width attenuates landmark-localisation noise at its source, which
+# tightens distance more than smoothing the final scalar alone. 0 disables.
+LMK_EMA_ALPHA    = 0.45               # new-frame weight; 1-α carried from prev
+LMK_EMA_RESET_PX = 40.0               # if a landmark jumps >this many pixels,
+                                      # treat as re-lock and seed EMA from it
 
 # ── False-positive filters ────────────────────────────────────────────────────
 SYMMETRY_THRESH   = 0.25              # min horizontal-flip NCC of the crop
