@@ -2,10 +2,11 @@
 datasets/
 DnHFaces/
 
-# Ignore all checkpoints by default, except the two required for inference
+# Ignore all checkpoints by default, except the ones required for inference
 checkpoints/*
 !checkpoints/face_detector.pth
 !checkpoints/landmark_net.pth
+!checkpoints/distance_net.pth
 
 # Temporary artefacts
 screenshot_*.png
