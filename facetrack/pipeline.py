@@ -39,9 +39,10 @@ from facetrack.config import (
     LMK_EMA_ALPHA, LMK_EMA_RESET_PX,
     UNDISTORT_ENABLE, UNDISTORT_K1, UNDISTORT_K2,
 )
-from facetrack.detector  import FaceDetectorCNN, DETECTOR_PATCH_SIZE
-from facetrack.landmarks import LandmarkCNN, LANDMARK_INFER_TF, flip_landmarks_horizontal
-from facetrack.filters   import (
+from facetrack.detector     import FaceDetectorCNN, DETECTOR_PATCH_SIZE
+from facetrack.landmarks    import LandmarkCNN, LANDMARK_INFER_TF, flip_landmarks_horizontal
+from facetrack.distance_net import DistanceNet, extract_distance_features
+from facetrack.filters      import (
     plausible_face_geometry,
     symmetry_score,
     skin_ratio,
@@ -267,12 +268,18 @@ class DetectionWorker:
                  det_thresh: float = DET_THRESH,
                  focal_px: Optional[float] = None,
                  landmark_net: Optional[LandmarkCNN] = None,
+                 distance_net: Optional[DistanceNet] = None,
                  ipd_m: float = IPD_METRES):
         self.detector     = detector
         self.device       = device
         self.det_thresh   = det_thresh
         self.focal_px     = focal_px         # None ⇒ auto-estimate per frame
         self.landmark_net = landmark_net
+        # Optional learned distance regressor. When present, overrides the
+        # classical IPD-formula result with a 20-D feature → distance MLP
+        # trained on MPIIGaze ground-truth head-translation labels. Falls back
+        # to the formula when None.
+        self.distance_net = distance_net
         # Per-user IPD override. Default is the 0.063 m adult population
         # average; an individual's real IPD is ±3 mm away, and using the
         # user's measured IPD removes up to ~5% of distance-accuracy bias.
@@ -435,6 +442,7 @@ class DetectionWorker:
             d = self._make_detection(frame_bgr, x1, y1, x2, y2, wsz,
                                      sx, W_orig, H_orig, focal_px)
             if d is not None:
+                self._apply_distance_net(d, focal_px, W_orig, H_orig)
                 detections.append(d)
 
         # ── Per-landmark EMA smoothing (locked, single-detection path) ───────
@@ -484,6 +492,29 @@ class DetectionWorker:
         det['eyes']     = derived['eyes']
         if derived['head_box'] is not None:
             det['box'] = derived['head_box']
+
+        # DistanceNet override: run on the EMA-smoothed landmarks so the
+        # learned regressor also benefits from upstream smoothing.
+        self._apply_distance_net(det, focal_px, W_orig, H_orig)
+
+    def _apply_distance_net(self, det: dict, focal_px: float,
+                             W_orig: int, H_orig: int) -> None:
+        """In-place: replace det['dist'] with DistanceNet output when the net
+        is loaded and features extract cleanly. Leave geometric fallback alone
+        otherwise."""
+        if self.distance_net is None:
+            return
+        lmks_abs = det.get('lmks_abs')
+        if lmks_abs is None:
+            return
+        feats = extract_distance_features(lmks_abs, det['box'], focal_px,
+                                          W_orig, H_orig)
+        if feats is None:
+            return
+        with torch.no_grad():
+            x = torch.from_numpy(feats).to(self.device).unsqueeze(0)
+            y = float(self.distance_net(x).item())
+        det['dist'] = round(max(0.3, min(y, 10.0)), 2)
 
     # ................................................. single-candidate path
 

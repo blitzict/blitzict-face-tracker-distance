@@ -31,6 +31,7 @@ import torch
 from facetrack              import SingleFaceTracker, DetectionWorker
 from facetrack.detector     import FaceDetectorCNN
 from facetrack.landmarks    import build_landmark_net
+from facetrack.distance_net import DistanceNet
 from facetrack.config       import (
     DET_THRESH, IPD_METRES, FOCAL_RATIO,
     FALLBACK_FACE_W_M, FALLBACK_FACE_FILL,
@@ -50,6 +51,24 @@ def load_detector(path: str, device: torch.device) -> FaceDetectorCNN:
     model.load_state_dict(ckpt['model'])
     model.eval()
     return model
+
+
+def load_distance_net(path: str, device: torch.device):
+    if not Path(path).exists():
+        return None
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        model = DistanceNet().to(device)
+        model.load_state_dict(ckpt['model'])
+        model.eval()
+        mae  = ckpt.get('val_mae_mm', float('nan'))
+        base = ckpt.get('baseline_mae_mm', float('nan'))
+        print(f"Distance net  : {path}  val MAE = {mae:.1f} mm  "
+              f"(formula baseline {base:.1f} mm)")
+        return model
+    except Exception as e:
+        print(f"Distance net  : failed to load ({e})")
+        return None
 
 
 def load_landmark_net(path: str, device: torch.device):
@@ -96,6 +115,7 @@ def draw_label(frame, box, dist_m: float) -> None:
 def run(camera_idx: int   = 0,
         det_ckpt:   str   = 'checkpoints/face_detector.pth',
         lmk_ckpt:   str   = 'checkpoints/landmark_net.pth',
+        dist_ckpt:  str   = 'checkpoints/distance_net.pth',
         det_thresh: float = DET_THRESH,
         focal_px:   float = 0.0,
         ipd_m:      float = IPD_METRES) -> None:
@@ -111,10 +131,15 @@ def run(camera_idx: int   = 0,
     if landmark_net is None:
         print("Landmark net  : not found — falling back to face-width geometry")
 
+    distance_net = load_distance_net(dist_ckpt, device)
+    if distance_net is None:
+        print("Distance net  : not found — using geometric IPD formula")
+
     worker = DetectionWorker(
         detector, device, det_thresh,
         focal_px     = focal_px if focal_px > 0 else None,
         landmark_net = landmark_net,
+        distance_net = distance_net,
         ipd_m        = ipd_m,
     )
     if abs(ipd_m - IPD_METRES) > 1e-6:
@@ -233,6 +258,8 @@ def main() -> None:
     p.add_argument('--camera',     type=int,   default=0)
     p.add_argument('--det_ckpt',   type=str,   default='checkpoints/face_detector.pth')
     p.add_argument('--lmk_ckpt',   type=str,   default='checkpoints/landmark_net.pth')
+    p.add_argument('--dist_ckpt',  type=str,   default='checkpoints/distance_net.pth',
+                   help='Learned DistanceNet. If missing, falls back to IPD formula.')
     p.add_argument('--det_thresh', type=float, default=DET_THRESH,
                    help='Detector sigmoid threshold (default 0.40)')
     p.add_argument('--focal',      type=float, default=0.0,
@@ -247,6 +274,7 @@ def main() -> None:
     run(camera_idx = args.camera,
         det_ckpt   = args.det_ckpt,
         lmk_ckpt   = args.lmk_ckpt,
+        dist_ckpt  = args.dist_ckpt,
         det_thresh = args.det_thresh,
         focal_px   = args.focal,
         ipd_m      = args.ipd)
