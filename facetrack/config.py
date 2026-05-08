@@ -14,8 +14,11 @@ DET_W, DET_H   = 320, 240             # detection resolution (downscaled)
 # Scales as fraction of min(H,W)=240. At 0.90 the window is 216 px in the
 # detection frame (~864 px in a 1280×720 original) — enough to contain a face
 # that fills most of the frame, i.e. the user very close to the camera.
-# Keep the smaller scales for far-away faces.
-DET_SCALES     = [0.70, 0.50, 0.35, 0.25, 0.16, 0.11]   # very close → very far
+# Smallest scale 0.16 → ~38 px window → faces ~150 px wide in a 1280 frame
+# (≈ 2 m on a typical webcam). The 0.11 scale was dropped: it generated >50%
+# of all patches but only added detection range past 3 m, which a desk
+# webcam rarely needs. Add it back if you need across-the-room detection.
+DET_SCALES     = [0.70, 0.50, 0.35, 0.25, 0.16]   # very close → far
 DET_STRIDE     = 0.28                 # stride = window_size × this value
 DET_THRESH     = 0.40                 # sigmoid score ≥ this counts as "face patch"
 DET_MAX_FACES  = 3                    # top-K peaks to extract per frame
